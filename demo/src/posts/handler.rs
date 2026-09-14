@@ -8,6 +8,7 @@ use chrono::Utc;
 use serde_json::json;
 
 use super::model::{CreatePost, Post, UpdatePost};
+use crate::extract::ValidatedJson;
 use crate::state::AppState;
 
 /// GET /posts — 전체 목록 (최신순)
@@ -35,9 +36,12 @@ pub async fn get_one(
 }
 
 /// POST /posts — 생성 (201 Created + Location 헤더)
+///
+/// `Json<CreatePost>` 대신 `ValidatedJson<CreatePost>`를 쓴다.
+/// 핸들러 본문은 하나도 안 바뀌었지만, 이제 값 검증까지 통과한 데이터만 들어온다.
 pub async fn create(
     State(state): State<AppState>,
-    Json(body): Json<CreatePost>, // 본문 extractor는 반드시 마지막 인자
+    ValidatedJson(body): ValidatedJson<CreatePost>, // 본문 extractor는 반드시 마지막 인자
 ) -> impl IntoResponse {
     let now = Utc::now();
     let post = Post {
@@ -45,6 +49,7 @@ pub async fn create(
         title: body.title,
         content: body.content,
         author: body.author,
+        tags: body.tags,
         created_at: now,
         updated_at: now,
     };
@@ -63,11 +68,14 @@ pub async fn create(
 pub async fn update(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    Json(body): Json<UpdatePost>,
+    ValidatedJson(body): ValidatedJson<UpdatePost>,
 ) -> Result<Json<Post>, (StatusCode, Json<serde_json::Value>)> {
     let mut posts = state.posts_mut().await;
 
-    let post = posts.iter_mut().find(|p| p.id == id).ok_or_else(|| not_found(id))?;
+    let post = posts
+        .iter_mut()
+        .find(|p| p.id == id)
+        .ok_or_else(|| not_found(id))?;
 
     // Option의 Some일 때만 덮어쓴다 = 부분 수정
     if let Some(title) = body.title {
@@ -75,6 +83,9 @@ pub async fn update(
     }
     if let Some(content) = body.content {
         post.content = content;
+    }
+    if let Some(tags) = body.tags {
+        post.tags = tags;
     }
     post.updated_at = Utc::now();
 
@@ -104,6 +115,6 @@ pub async fn delete(
 fn not_found(id: i64) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::NOT_FOUND,
-        Json(json!({ "error": format!("post {id} not found") })),
+        Json(json!({ "error": "not_found", "message": format!("post {id} not found") })),
     )
 }
