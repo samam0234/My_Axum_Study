@@ -11,13 +11,16 @@ pub struct AppState {
     pub db: DbPool,
     /// JWT 서명 키. `String`은 Clone이 실제 복사라서 `Arc`로 감싼다. (study6)
     pub jwt_secret: Arc<String>,
+    /// 업로드 파일을 저장할 폴더. (study9에서 설정으로 분리)
+    pub upload_dir: Arc<String>,
 }
 
 impl AppState {
-    pub fn new(db: DbPool, jwt_secret: String) -> Self {
+    pub fn new(db: DbPool, jwt_secret: String, upload_dir: String) -> Self {
         Self {
             db,
             jwt_secret: Arc::new(jwt_secret),
+            upload_dir: Arc::new(upload_dir),
         }
     }
 }

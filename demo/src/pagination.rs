@@ -68,3 +68,63 @@ impl<T> Page<T> {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 유닛 테스트
+//
+// Rust는 테스트를 **같은 파일 안**에 둔다. `#[cfg(test)]`가 붙어 있어서
+// 일반 빌드에는 포함되지 않고, `cargo test`에서만 컴파일된다.
+// 같은 모듈이므로 비공개 항목에도 접근할 수 있다.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn query(page: u32, per_page: u32) -> PageQuery {
+        PageQuery {
+            page,
+            per_page,
+            q: None,
+            tag: None,
+        }
+    }
+
+    #[test]
+    fn offset은_페이지와_크기로_계산된다() {
+        assert_eq!(query(1, 10).offset(), 0);
+        assert_eq!(query(2, 10).offset(), 10);
+        assert_eq!(query(3, 25).offset(), 50);
+    }
+
+    #[test]
+    fn total_pages는_올림_계산이다() {
+        // 25건을 10개씩 → 3페이지 (2.5가 아니라)
+        let page = Page::new(Vec::<i32>::new(), &query(1, 10), 25);
+        assert_eq!(page.total_pages, 3);
+        assert!(page.has_next);
+    }
+
+    #[test]
+    fn 마지막_페이지에서는_has_next가_false다() {
+        let page = Page::new(Vec::<i32>::new(), &query(3, 10), 25);
+        assert_eq!(page.total_pages, 3);
+        assert!(!page.has_next);
+    }
+
+    #[test]
+    fn 결과가_없으면_total_pages는_0이다() {
+        let page = Page::new(Vec::<i32>::new(), &query(1, 10), 0);
+        assert_eq!(page.total_pages, 0);
+        assert!(!page.has_next);
+    }
+
+    #[test]
+    fn 검증_규칙이_범위를_막는다() {
+        use validator::Validate;
+
+        assert!(query(1, 10).validate().is_ok());
+        assert!(query(0, 10).validate().is_err()); // page >= 1
+        assert!(query(1, 0).validate().is_err()); // per_page >= 1
+        assert!(query(1, 101).validate().is_err()); // per_page <= 100
+    }
+}

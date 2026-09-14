@@ -74,7 +74,7 @@ pub async fn delete(
     if repo::delete(&state.db, id).await? {
         // 글을 지웠으면 썸네일 파일도 정리한다.
         if let Some(thumbnail) = row.thumbnail {
-            upload::remove_if_exists(&thumbnail).await;
+            upload::remove_if_exists(&state.upload_dir, &thumbnail).await;
         }
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -91,11 +91,11 @@ pub async fn upload_thumbnail(
 ) -> AppResult<Json<Post>> {
     let existing = ensure_owner(&state, id, &auth).await?;
 
-    let filename = upload::save_image(multipart).await?;
+    let filename = upload::save_image(&state.upload_dir, multipart).await?;
 
     // 새 파일을 저장한 뒤 기존 파일을 지운다. (순서가 반대면 실패 시 둘 다 잃는다)
     if let Some(old) = existing.thumbnail {
-        upload::remove_if_exists(&old).await;
+        upload::remove_if_exists(&state.upload_dir, &old).await;
     }
 
     repo::set_thumbnail(&state.db, id, &filename)
