@@ -1,16 +1,13 @@
+mod error;
 mod extract;
 mod posts;
 mod state;
 
-use axum::{
-    Json, Router,
-    extract::{Path, Query},
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
-};
+use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get};
 use serde::{Deserialize, Serialize};
 
+use crate::error::{AppResult, handle_404, handle_405};
+use crate::extract::{Path, Query};
 use crate::state::AppState;
 
 #[tokio::main]
@@ -35,8 +32,13 @@ fn app(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/hello/{name}", get(hello))
         .route("/echo", get(echo))
+        .route("/boom", get(boom))
         // 게시판 라우터를 /posts 아래에 장착한다.
         .nest("/posts", posts::router())
+        // 매칭되는 경로가 없을 때 (404)
+        .fallback(handle_404)
+        // 경로는 있는데 메서드가 다를 때 (405)
+        .method_not_allowed_fallback(handle_405)
         // 여기서 상태를 주입하면 Router<AppState> → Router<()> 가 된다.
         .with_state(state)
 }
@@ -59,7 +61,7 @@ async fn hello(Path(name): Path<String>) -> String {
 
 #[derive(Debug, Deserialize)]
 struct EchoParams {
-    /// 필수 파라미터. 없으면 axum이 400을 돌려준다.
+    /// 필수 파라미터. 없으면 400.
     message: String,
     /// Option<T>로 선언하면 선택 파라미터가 된다.
     times: Option<u8>,
@@ -80,4 +82,15 @@ async fn echo(Query(params): Query<EchoParams>) -> Json<EchoResponse> {
         original: params.message,
         repeated,
     })
+}
+
+/// 500 응답 확인용 엔드포인트.
+/// `anyhow::Error`가 `?`로 `AppError::Internal`로 자동 변환되는 것을 보여준다.
+async fn boom() -> AppResult<&'static str> {
+    let raw = "not-a-number";
+    // ParseIntError → anyhow::Error → AppError::Internal
+    let _n: i32 = raw
+        .parse()
+        .map_err(|e: std::num::ParseIntError| anyhow::anyhow!("설정 값 파싱 실패: {e}"))?;
+    Ok("unreachable")
 }
