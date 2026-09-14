@@ -72,6 +72,28 @@ where
     }
 }
 
+/// `Query<T>` + `validator` 검증. 페이지네이션 파라미터 검사에 쓴다. (study8)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ValidatedQuery<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for ValidatedQuery<T>
+where
+    T: DeserializeOwned + Validate,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let axum::extract::Query(value) =
+            axum::extract::Query::<T>::from_request_parts(parts, state)
+                .await
+                .map_err(|rejection| AppError::BadRequest(rejection.body_text()))?;
+
+        value.validate()?;
+        Ok(ValidatedQuery(value))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `?` 연산자가 자동 변환할 수 있도록 From 구현
 // ---------------------------------------------------------------------------

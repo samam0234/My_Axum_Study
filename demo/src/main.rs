@@ -3,8 +3,10 @@ mod db;
 mod error;
 mod extract;
 mod middleware;
+mod pagination;
 mod posts;
 mod state;
+mod upload;
 
 use std::time::Duration;
 
@@ -19,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tower::ServiceBuilder;
 use tower_http::{
     catch_panic::CatchPanicLayer,
+    services::ServeDir,
     compression::CompressionLayer,
     cors::CorsLayer,
     request_id::{PropagateRequestIdLayer, SetRequestIdLayer},
@@ -42,6 +45,9 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = db::init(&database_url).await?;
     tracing::info!(%database_url, "database ready");
+
+    // 업로드 폴더 준비 (study8)
+    upload::ensure_dir().await?;
 
     // 학습용 기본값. 운영에서는 반드시 환경변수로 주입한다. (study9에서 설정 관리로 정리)
     let jwt_secret = std::env::var("JWT_SECRET")
@@ -82,6 +88,9 @@ fn app(state: AppState) -> Router {
         .nest("/posts", posts::router())
         // 인증 라우터
         .nest("/auth", auth::router())
+        // 업로드된 파일을 정적으로 서빙한다. (study8)
+        // ServeDir은 Router가 아니라 tower Service라서 nest_service를 쓴다.
+        .nest_service("/uploads", ServeDir::new(upload::UPLOAD_DIR))
         // 매칭되는 경로가 없을 때 (404)
         .fallback(handle_404)
         // 경로는 있는데 메서드가 다를 때 (405)

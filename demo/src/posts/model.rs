@@ -12,6 +12,8 @@ pub struct Post {
     pub author: String,
     pub author_id: Option<i64>,
     pub tags: Vec<String>,
+    /// 업로드된 썸네일 파일명. `/uploads/<파일명>`으로 접근한다. (study8)
+    pub thumbnail: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -29,6 +31,7 @@ pub struct PostRow {
     /// study6에서 추가된 FK. 인증 도입 전에 만들어진 글은 NULL이다.
     pub author_id: Option<i64>,
     pub tags: String,
+    pub thumbnail: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -43,6 +46,7 @@ impl From<PostRow> for Post {
             author_id: row.author_id,
             // 저장된 JSON이 깨져 있어도 500을 내지 않고 빈 배열로 처리한다.
             tags: serde_json::from_str(&row.tags).unwrap_or_default(),
+            thumbnail: row.thumbnail,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }

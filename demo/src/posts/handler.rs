@@ -1,16 +1,25 @@
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{Json, extract::Multipart, extract::State, http::StatusCode, response::IntoResponse};
 
 use super::model::{CreatePost, Post, UpdatePost};
 use super::repo;
 use crate::auth::extractor::AuthUser;
 use crate::error::{AppError, AppResult};
-use crate::extract::{Path, ValidatedJson};
+use crate::extract::{Path, ValidatedJson, ValidatedQuery};
+use crate::pagination::{Page, PageQuery};
 use crate::state::AppState;
+use crate::upload;
 
-/// GET /posts — 전체 목록 (최신순). 인증 불필요.
-pub async fn list(State(state): State<AppState>) -> AppResult<Json<Vec<Post>>> {
-    let rows = repo::list(&state.db).await?; // sqlx::Error → AppError 자동 변환
-    Ok(Json(rows.into_iter().map(Post::from).collect()))
+/// GET /posts — 페이지 목록. 인증 불필요.
+///
+/// `?page=1&per_page=10&q=검색어&tag=rust`
+pub async fn list(
+    State(state): State<AppState>,
+    ValidatedQuery(query): ValidatedQuery<PageQuery>,
+) -> AppResult<Json<Page<Post>>> {
+    let (rows, total) = repo::list_paged(&state.db, &query).await?;
+    let items = rows.into_iter().map(Post::from).collect();
+
+    Ok(Json(Page::new(items, &query, total)))
 }
 
 /// GET /posts/{id} — 단건 조회. 인증 불필요.
@@ -60,30 +69,62 @@ pub async fn delete(
     auth: AuthUser,
     Path(id): Path<i64>,
 ) -> AppResult<StatusCode> {
-    ensure_owner(&state, id, &auth).await?;
+    let row = ensure_owner(&state, id, &auth).await?;
 
     if repo::delete(&state.db, id).await? {
+        // 글을 지웠으면 썸네일 파일도 정리한다.
+        if let Some(thumbnail) = row.thumbnail {
+            upload::remove_if_exists(&thumbnail).await;
+        }
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(AppError::not_found("post", id))
     }
 }
 
-/// 글이 존재하는지 + 요청자가 작성자인지 확인한다.
+/// POST /posts/{id}/thumbnail — 썸네일 업로드 (multipart/form-data). **인증 필요**
+pub async fn upload_thumbnail(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<i64>,
+    multipart: Multipart, // 본문 extractor라서 마지막 인자
+) -> AppResult<Json<Post>> {
+    let existing = ensure_owner(&state, id, &auth).await?;
+
+    let filename = upload::save_image(multipart).await?;
+
+    // 새 파일을 저장한 뒤 기존 파일을 지운다. (순서가 반대면 실패 시 둘 다 잃는다)
+    if let Some(old) = existing.thumbnail {
+        upload::remove_if_exists(&old).await;
+    }
+
+    repo::set_thumbnail(&state.db, id, &filename)
+        .await?
+        .map(|row| Json(Post::from(row)))
+        .ok_or_else(|| AppError::not_found("post", id))
+}
+
+/// 글이 존재하는지 + 요청자가 작성자인지 확인하고, 그 행을 돌려준다.
 ///
 /// - 글이 없으면 404
 /// - 남의 글이면 403
 ///
 /// **인증(authentication)과 인가(authorization)는 다른 문제**라는 걸 보여주는 자리.
 /// extractor는 "누구인지"까지만 알려주고, "무엇을 할 수 있는지"는 여기서 판단한다.
-async fn ensure_owner(state: &AppState, post_id: i64, auth: &AuthUser) -> AppResult<()> {
+async fn ensure_owner(
+    state: &AppState,
+    post_id: i64,
+    auth: &AuthUser,
+) -> AppResult<super::model::PostRow> {
     let row = repo::find(&state.db, post_id)
         .await?
         .ok_or_else(|| AppError::not_found("post", post_id))?;
 
     match row.author_id {
-        Some(owner_id) if owner_id == auth.id => Ok(()),
+        Some(owner_id) if owner_id == auth.id => Ok(row),
         // 인증 도입 전에 만들어진 글(author_id IS NULL)은 주인이 없으므로 수정 불가로 본다.
-        _ => Err(AppError::Forbidden("본인이 작성한 글만 수정/삭제할 수 있습니다".into())),
+        _ => Err(AppError::Forbidden(
+            "본인이 작성한 글만 수정/삭제할 수 있습니다".into(),
+        )),
     }
 }

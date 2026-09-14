@@ -2,9 +2,10 @@ pub mod handler;
 pub mod model;
 pub mod repo;
 
-use axum::{Router, routing::get};
+use axum::{Router, extract::DefaultBodyLimit, routing::{get, post}};
 
 use crate::state::AppState;
+use crate::upload::MAX_UPLOAD_BYTES;
 
 /// 게시판 관련 라우트만 모아 둔 하위 라우터.
 ///
@@ -19,5 +20,11 @@ pub fn router() -> Router<AppState> {
             get(handler::get_one)
                 .patch(handler::update)
                 .delete(handler::delete),
+        )
+        .route(
+            "/{id}/thumbnail",
+            // 이 라우트만 본문 한도를 크게 잡는다.
+            // 전역 DefaultBodyLimit(2MB)보다 **안쪽**에 붙은 값이 이긴다.
+            post(handler::upload_thumbnail).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
 }
