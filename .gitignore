@@ -1,0 +1,25 @@
+# Rust build output
+**/target/
+
+# env
+**/.env
+**/.env.*
+!**/.env.example
+
+# db (sqlx/SeaORM SQLite 파일)
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.sqlite
+**/*.sqlite3
+
+# uploaded files (폴더 구조만 유지)
+**/uploads/*
+!**/uploads/.gitkeep
+
+# logs
+**/*.log
+
+# editor
+.vscode/*
+!.vscode/extensions.json
