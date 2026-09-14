@@ -2,6 +2,9 @@
 //!
 //! Spring의 `JpaRepository`, Nest의 `Repository<Post>`에 해당한다.
 //! 다만 sqlx는 ORM이 아니라서 **SQL을 직접 쓴다.** 대신 무슨 쿼리가 나가는지 100% 명확하다.
+//!
+//! ⚠️ sqlx 0.9부터 `query`/`query_as`는 `&'static str`(리터럴)만 받는다(`SqlSafeStr`).
+//!    `format!`으로 SQL을 조립하면 컴파일 에러가 난다 — SQL 인젝션을 타입으로 막는 설계다.
 
 use chrono::{DateTime, Utc};
 
@@ -12,7 +15,7 @@ use crate::db::DbPool;
 pub async fn list(db: &DbPool) -> Result<Vec<PostRow>, sqlx::Error> {
     sqlx::query_as::<_, PostRow>(
         r#"
-        SELECT id, title, content, author, tags, created_at, updated_at
+        SELECT id, title, content, author, author_id, tags, created_at, updated_at
         FROM posts
         ORDER BY id DESC
         "#,
@@ -25,7 +28,7 @@ pub async fn list(db: &DbPool) -> Result<Vec<PostRow>, sqlx::Error> {
 pub async fn find(db: &DbPool, id: i64) -> Result<Option<PostRow>, sqlx::Error> {
     sqlx::query_as::<_, PostRow>(
         r#"
-        SELECT id, title, content, author, tags, created_at, updated_at
+        SELECT id, title, content, author, author_id, tags, created_at, updated_at
         FROM posts
         WHERE id = ?
         "#,
@@ -36,20 +39,26 @@ pub async fn find(db: &DbPool, id: i64) -> Result<Option<PostRow>, sqlx::Error> 
 }
 
 /// 생성. `RETURNING`으로 INSERT와 조회를 한 번에 끝낸다.
-pub async fn insert(db: &DbPool, input: &CreatePost) -> Result<PostRow, sqlx::Error> {
+pub async fn insert(
+    db: &DbPool,
+    input: &CreatePost,
+    author: &str,
+    author_id: i64,
+) -> Result<PostRow, sqlx::Error> {
     let now: DateTime<Utc> = Utc::now();
     let tags = serde_json::to_string(&input.tags).unwrap_or_else(|_| "[]".to_string());
 
     sqlx::query_as::<_, PostRow>(
         r#"
-        INSERT INTO posts (title, content, author, tags, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        RETURNING id, title, content, author, tags, created_at, updated_at
+        INSERT INTO posts (title, content, author, author_id, tags, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        RETURNING id, title, content, author, author_id, tags, created_at, updated_at
         "#,
     )
     .bind(&input.title)
     .bind(&input.content)
-    .bind(&input.author)
+    .bind(author)
+    .bind(author_id)
     .bind(tags)
     .bind(now)
     .bind(now)
@@ -79,7 +88,7 @@ pub async fn update(
             tags       = COALESCE(?, tags),
             updated_at = ?
         WHERE id = ?
-        RETURNING id, title, content, author, tags, created_at, updated_at
+        RETURNING id, title, content, author, author_id, tags, created_at, updated_at
         "#,
     )
     .bind(input.title.as_ref())

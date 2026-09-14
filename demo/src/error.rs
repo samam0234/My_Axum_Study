@@ -30,19 +30,16 @@ pub enum AppError {
     #[error("validation failed")]
     Validation(validator::ValidationErrors),
 
-    /// 인증 실패 → 401 (study6에서 사용)
+    /// 인증 실패 → 401
     #[error("{0}")]
-    #[allow(dead_code)] // 아직 안 쓰지만 곧 쓴다
     Unauthorized(String),
 
-    /// 권한 없음 → 403 (study7에서 사용)
+    /// 권한 없음 → 403 (소유권 검사)
     #[error("{0}")]
-    #[allow(dead_code)] // 아직 안 쓰지만 곧 쓴다
     Forbidden(String),
 
-    /// 중복 등 상태 충돌 → 409 (study6에서 사용)
+    /// 중복 등 상태 충돌 → 409
     #[error("{0}")]
-    #[allow(dead_code)] // 아직 안 쓰지만 곧 쓴다
     Conflict(String),
 
     /// DB 오류 → 500. `#[from]` 덕분에 `?` 하나로 sqlx::Error가 여기로 들어온다.

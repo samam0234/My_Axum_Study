@@ -10,6 +10,7 @@ pub struct Post {
     pub title: String,
     pub content: String,
     pub author: String,
+    pub author_id: Option<i64>,
     pub tags: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -25,6 +26,8 @@ pub struct PostRow {
     pub title: String,
     pub content: String,
     pub author: String,
+    /// study6에서 추가된 FK. 인증 도입 전에 만들어진 글은 NULL이다.
+    pub author_id: Option<i64>,
     pub tags: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -37,6 +40,7 @@ impl From<PostRow> for Post {
             title: row.title,
             content: row.content,
             author: row.author,
+            author_id: row.author_id,
             // 저장된 JSON이 깨져 있어도 500을 내지 않고 빈 배열로 처리한다.
             tags: serde_json::from_str(&row.tags).unwrap_or_default(),
             created_at: row.created_at,
@@ -46,6 +50,9 @@ impl From<PostRow> for Post {
 }
 
 /// 생성 요청 본문(DTO).
+///
+/// study5까지 있던 `author` 필드가 사라졌다.
+/// **작성자는 클라이언트가 정하는 값이 아니라 토큰에서 나오는 값**이기 때문이다.
 #[derive(Debug, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct CreatePost {
@@ -54,9 +61,6 @@ pub struct CreatePost {
 
     #[validate(length(min = 1, max = 5000, message = "본문은 1~5000자여야 합니다"))]
     pub content: String,
-
-    #[validate(length(min = 2, max = 20, message = "작성자는 2~20자여야 합니다"))]
-    pub author: String,
 
     #[serde(default)]
     #[validate(length(max = 5, message = "태그는 최대 5개까지 가능합니다"))]

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::db::DbPool;
 
 /// 앱 전역에서 공유되는 상태.
@@ -7,10 +9,15 @@ use crate::db::DbPool;
 #[derive(Clone)]
 pub struct AppState {
     pub db: DbPool,
+    /// JWT 서명 키. `String`은 Clone이 실제 복사라서 `Arc`로 감싼다. (study6)
+    pub jwt_secret: Arc<String>,
 }
 
 impl AppState {
-    pub fn new(db: DbPool) -> Self {
-        Self { db }
+    pub fn new(db: DbPool, jwt_secret: String) -> Self {
+        Self {
+            db,
+            jwt_secret: Arc::new(jwt_secret),
+        }
     }
 }

@@ -1,3 +1,4 @@
+mod auth;
 mod db;
 mod error;
 mod extract;
@@ -21,7 +22,11 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::init(&database_url).await?;
     println!("database ready: {database_url}");
 
-    let app = app(AppState::new(pool));
+    // 학습용 기본값. 운영에서는 반드시 환경변수로 주입한다. (study9에서 설정 관리로 정리)
+    let jwt_secret = std::env::var("JWT_SECRET")
+        .unwrap_or_else(|_| "dev-only-insecure-secret-change-me".to_string());
+
+    let app = app(AppState::new(pool, jwt_secret));
 
     // 0.7부터 hyper Server가 아니라 tokio TcpListener + axum::serve 조합을 쓴다.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
@@ -41,6 +46,8 @@ fn app(state: AppState) -> Router {
         .route("/boom", get(boom))
         // 게시판 라우터를 /posts 아래에 장착한다.
         .nest("/posts", posts::router())
+        // 인증 라우터
+        .nest("/auth", auth::router())
         // 매칭되는 경로가 없을 때 (404)
         .fallback(handle_404)
         // 경로는 있는데 메서드가 다를 때 (405)
