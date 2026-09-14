@@ -1,3 +1,6 @@
+mod posts;
+mod state;
+
 use axum::{
     Json, Router,
     extract::{Path, Query},
@@ -7,9 +10,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::state::AppState;
+
 #[tokio::main]
 async fn main() {
-    let app = app();
+    let state = AppState::new();
+    let app = app(state);
 
     // 0.7부터 hyper Server가 아니라 tokio TcpListener + axum::serve 조합을 쓴다.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
@@ -22,12 +28,16 @@ async fn main() {
 }
 
 /// 라우터 조립만 따로 함수로 빼두면 나중에 통합 테스트에서 그대로 재사용할 수 있다. (study9)
-fn app() -> Router {
+fn app(state: AppState) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/health", get(health))
         .route("/hello/{name}", get(hello))
         .route("/echo", get(echo))
+        // 게시판 라우터를 /posts 아래에 장착한다.
+        .nest("/posts", posts::router())
+        // 여기서 상태를 주입하면 Router<AppState> → Router<()> 가 된다.
+        .with_state(state)
 }
 
 /// 가장 단순한 핸들러: &'static str도 IntoResponse를 구현하므로 그대로 반환할 수 있다.
