@@ -8,6 +8,17 @@ use crate::extract::ValidatedJson;
 use crate::state::AppState;
 
 /// POST /auth/register — 회원가입
+#[utoipa::path(
+    post,
+    path = "/auth/register",
+    tag = "auth",
+    request_body = RegisterRequest,
+    responses(
+        (status = 201, description = "가입됨", body = UserPublic),
+        (status = 409, description = "아이디/이메일 중복"),
+        (status = 422, description = "검증 실패"),
+    )
+)]
 pub async fn register(
     State(state): State<AppState>,
     ValidatedJson(body): ValidatedJson<RegisterRequest>,
@@ -22,6 +33,16 @@ pub async fn register(
 }
 
 /// POST /auth/login — 로그인 후 JWT 발급
+#[utoipa::path(
+    post,
+    path = "/auth/login",
+    tag = "auth",
+    request_body = LoginRequest,
+    responses(
+        (status = 200, description = "토큰 발급", body = TokenResponse),
+        (status = 401, description = "아이디 또는 비밀번호 불일치"),
+    )
+)]
 pub async fn login(
     State(state): State<AppState>,
     ValidatedJson(body): ValidatedJson<LoginRequest>,
@@ -55,6 +76,16 @@ pub async fn login(
 /// GET /auth/me — 내 정보 (인증 필요)
 ///
 /// 인자에 `AuthUser`가 있다는 것만으로 이 라우트는 보호된다.
+#[utoipa::path(
+    get,
+    path = "/auth/me",
+    tag = "auth",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "내 정보", body = UserPublic),
+        (status = 401, description = "토큰 없음/만료/위조"),
+    )
+)]
 pub async fn me(State(state): State<AppState>, auth: AuthUser) -> AppResult<Json<UserPublic>> {
     repo::find_by_id(&state.db, auth.id)
         .await?

@@ -12,6 +12,16 @@ use crate::upload;
 /// GET /posts — 페이지 목록. 인증 불필요.
 ///
 /// `?page=1&per_page=10&q=검색어&tag=rust`
+#[utoipa::path(
+    get,
+    path = "/posts",
+    tag = "posts",
+    params(PageQuery),
+    responses(
+        (status = 200, description = "게시글 페이지", body = Page<Post>),
+        (status = 422, description = "페이지 파라미터 범위 오류"),
+    )
+)]
 pub async fn list(
     State(state): State<AppState>,
     ValidatedQuery(query): ValidatedQuery<PageQuery>,
@@ -23,6 +33,16 @@ pub async fn list(
 }
 
 /// GET /posts/{id} — 단건 조회. 인증 불필요.
+#[utoipa::path(
+    get,
+    path = "/posts/{id}",
+    tag = "posts",
+    params(("id" = i64, Path, description = "게시글 id")),
+    responses(
+        (status = 200, description = "게시글", body = Post),
+        (status = 404, description = "없는 게시글"),
+    )
+)]
 pub async fn get_one(State(state): State<AppState>, Path(id): Path<i64>) -> AppResult<Json<Post>> {
     repo::find(&state.db, id)
         .await?
@@ -31,6 +51,18 @@ pub async fn get_one(State(state): State<AppState>, Path(id): Path<i64>) -> AppR
 }
 
 /// POST /posts — 생성. **인증 필요** (인자에 `AuthUser`가 있다는 것이 곧 가드다)
+#[utoipa::path(
+    post,
+    path = "/posts",
+    tag = "posts",
+    request_body = CreatePost,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 201, description = "생성됨", body = Post),
+        (status = 401, description = "인증 필요"),
+        (status = 422, description = "검증 실패"),
+    )
+)]
 pub async fn create(
     State(state): State<AppState>,
     auth: AuthUser,                                 // ← 토큰이 없거나 틀리면 여기서 401
@@ -48,6 +80,19 @@ pub async fn create(
 }
 
 /// PATCH /posts/{id} — 부분 수정. **인증 필요**
+#[utoipa::path(
+    patch,
+    path = "/posts/{id}",
+    tag = "posts",
+    params(("id" = i64, Path, description = "게시글 id")),
+    request_body = UpdatePost,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "수정됨", body = Post),
+        (status = 403, description = "본인 글이 아님"),
+        (status = 404, description = "없는 게시글"),
+    )
+)]
 pub async fn update(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -64,6 +109,18 @@ pub async fn update(
 }
 
 /// DELETE /posts/{id} — 삭제. **인증 필요**
+#[utoipa::path(
+    delete,
+    path = "/posts/{id}",
+    tag = "posts",
+    params(("id" = i64, Path, description = "게시글 id")),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 204, description = "삭제됨"),
+        (status = 403, description = "본인 글이 아님"),
+        (status = 404, description = "없는 게시글"),
+    )
+)]
 pub async fn delete(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -83,6 +140,19 @@ pub async fn delete(
 }
 
 /// POST /posts/{id}/thumbnail — 썸네일 업로드 (multipart/form-data). **인증 필요**
+#[utoipa::path(
+    post,
+    path = "/posts/{id}/thumbnail",
+    tag = "posts",
+    params(("id" = i64, Path, description = "게시글 id")),
+    request_body(content = String, description = "multipart/form-data의 `file` 필드", content_type = "multipart/form-data"),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "썸네일이 설정된 게시글", body = Post),
+        (status = 400, description = "지원하지 않는 형식"),
+        (status = 403, description = "본인 글이 아님"),
+    )
+)]
 pub async fn upload_thumbnail(
     State(state): State<AppState>,
     auth: AuthUser,

@@ -20,6 +20,8 @@ tower = { version = "0.5.3", features = ["util", "timeout"] }
 tower-http = { version = "0.7.1", features = ["trace", "cors", "compression-gzip", "timeout", "limit", "request-id", "catch-panic", "normalize-path", "fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+utoipa = { version = "5.5.0", features = ["axum_extras", "chrono"] }
+utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 uuid = { version = "1.26.1", features = ["v4"] }
 validator = { version = "0.21.0", features = ["derive"] }
 
@@ -27,3 +29,12 @@ validator = { version = "0.21.0", features = ["derive"] }
 http-body-util = "0.1.5"
 serde_json = "1.0.151"
 tower = { version = "0.5.3", features = ["util"] }
+
+# 릴리스 빌드 최적화.
+# 빌드 시간은 늘어나지만 바이너리가 작아지고 실행이 빨라진다.
+[profile.release]
+opt-level = 3
+lto = "thin"        # 크레이트 경계를 넘는 인라이닝. "fat"은 더 공격적이지만 훨씬 느리다
+codegen-units = 1   # 병렬 컴파일을 포기하고 최적화 기회를 늘린다
+strip = true        # 심볼 제거 (백트레이스는 잃는다)
+# panic = "abort"   # ⚠️ 절대 켜지 말 것: CatchPanicLayer가 동작하지 않게 된다 (study7)

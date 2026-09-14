@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    image: axum-demo:latest
+    ports:
+      - "3000:3000"
+    environment:
+      # ⚠️ 운영에서는 여기에 직접 적지 말고 시크릿 관리 도구를 쓴다.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 환경변수를 설정하세요}
+      RUST_LOG: demo=info,tower_http=info
+    volumes:
+      # 컨테이너를 지워도 DB와 업로드 파일은 남는다.
+      - api-data:/app/data
+      - api-uploads:/app/uploads
+    restart: unless-stopped
+
+volumes:
+  api-data:
+  api-uploads:

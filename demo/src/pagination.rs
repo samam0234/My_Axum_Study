@@ -1,6 +1,7 @@
 //! 페이지네이션 공통 타입.
 
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
 fn default_page() -> u32 {
@@ -11,7 +12,8 @@ fn default_per_page() -> u32 {
 }
 
 /// `?page=1&per_page=20&q=검색어&tag=rust` 형태의 쿼리 파라미터.
-#[derive(Debug, Deserialize, Validate)]
+#[derive(Debug, Deserialize, Validate, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct PageQuery {
     #[serde(default = "default_page")]
     #[validate(range(min = 1, message = "page는 1 이상이어야 합니다"))]
@@ -42,7 +44,8 @@ impl PageQuery {
 /// 페이지네이션 응답 껍데기.
 ///
 /// 배열을 그대로 반환하면 "전체가 몇 건인지", "다음 페이지가 있는지"를 알려줄 자리가 없다.
-#[derive(Debug, Serialize)]
+// utoipa 5는 제네릭 스키마를 그대로 지원한다. (4까지 있던 #[aliases]는 제거됨)
+#[derive(Debug, Serialize, ToSchema)]
 pub struct Page<T> {
     pub items: Vec<T>,
     pub page: u32,

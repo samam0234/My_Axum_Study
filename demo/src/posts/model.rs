@@ -1,10 +1,11 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use utoipa::ToSchema;
 use validator::Validate;
 
 /// API 응답으로 나가는 게시글.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Post {
     pub id: i64,
     pub title: String,
@@ -57,7 +58,7 @@ impl From<PostRow> for Post {
 ///
 /// study5까지 있던 `author` 필드가 사라졌다.
 /// **작성자는 클라이언트가 정하는 값이 아니라 토큰에서 나오는 값**이기 때문이다.
-#[derive(Debug, Deserialize, Validate)]
+#[derive(Debug, Deserialize, Validate, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreatePost {
     #[validate(length(min = 1, max = 100, message = "제목은 1~100자여야 합니다"))]
@@ -72,7 +73,7 @@ pub struct CreatePost {
 }
 
 /// 수정 요청 본문. 모든 필드가 `Option`이라 부분 수정이 가능하다.
-#[derive(Debug, Deserialize, Validate)]
+#[derive(Debug, Deserialize, Validate, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdatePost {
     #[validate(length(min = 1, max = 100, message = "제목은 1~100자여야 합니다"))]

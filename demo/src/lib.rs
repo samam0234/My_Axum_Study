@@ -9,6 +9,7 @@ pub mod db;
 pub mod error;
 pub mod extract;
 pub mod middleware;
+pub mod openapi;
 pub mod pagination;
 pub mod posts;
 pub mod routes;
@@ -30,6 +31,8 @@ use tower_http::{
     timeout::TimeoutLayer, trace::TraceLayer,
 };
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 use crate::error::{handle_404, handle_405};
 use crate::state::AppState;
@@ -54,6 +57,9 @@ pub fn app(state: AppState) -> Router {
     let upload_dir = state.upload_dir.as_str().to_string();
 
     Router::new()
+        // Swagger UI: http://127.0.0.1:3000/docs
+        // OpenAPI JSON: http://127.0.0.1:3000/api-docs/openapi.json
+        .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", openapi::ApiDoc::openapi()))
         .route("/", get(routes::root))
         .route("/health", get(routes::health))
         .route("/hello/{name}", get(routes::hello))
