@@ -45,6 +45,10 @@ pub enum AppError {
     #[allow(dead_code)] // 아직 안 쓰지만 곧 쓴다
     Conflict(String),
 
+    /// DB 오류 → 500. `#[from]` 덕분에 `?` 하나로 sqlx::Error가 여기로 들어온다.
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+
     /// 예상하지 못한 내부 오류 → 500. 원인은 로그에만 남기고 클라이언트에는 숨긴다.
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
@@ -80,7 +84,7 @@ impl AppError {
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) => StatusCode::CONFLICT,
-            Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Database(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -93,7 +97,7 @@ impl AppError {
             Self::Unauthorized(_) => "unauthorized",
             Self::Forbidden(_) => "forbidden",
             Self::Conflict(_) => "conflict",
-            Self::Internal(_) => "internal_error",
+            Self::Database(_) | Self::Internal(_) => "internal_error",
         }
     }
 }
@@ -110,6 +114,10 @@ impl IntoResponse for AppError {
 
         let message = match &self {
             // 500은 내부 사정을 밖으로 흘리지 않는다. 원인은 서버 로그에만.
+            Self::Database(err) => {
+                eprintln!("[db error] {err:?}");
+                "서버 내부 오류가 발생했습니다.".to_string()
+            }
             Self::Internal(err) => {
                 eprintln!("[internal error] {err:?}");
                 "서버 내부 오류가 발생했습니다.".to_string()

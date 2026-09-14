@@ -1,3 +1,4 @@
+mod db;
 mod error;
 mod extract;
 mod posts;
@@ -11,18 +12,23 @@ use crate::extract::{Path, Query};
 use crate::state::AppState;
 
 #[tokio::main]
-async fn main() {
-    let state = AppState::new();
-    let app = app(state);
+async fn main() -> anyhow::Result<()> {
+    // DATABASE_URL이 없으면 프로젝트 폴더의 data.db를 쓴다.
+    // `mode=rwc` = read/write/create. (study9에서 .env 기반 설정으로 정리한다)
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite://data.db?mode=rwc".to_string());
+
+    let pool = db::init(&database_url).await?;
+    println!("database ready: {database_url}");
+
+    let app = app(AppState::new(pool));
 
     // 0.7부터 hyper Server가 아니라 tokio TcpListener + axum::serve 조합을 쓴다.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
-        .await
-        .expect("3000 포트를 열 수 없습니다");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    println!("listening on http://{}", listener.local_addr()?);
 
-    println!("listening on http://{}", listener.local_addr().unwrap());
-
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 /// 라우터 조립만 따로 함수로 빼두면 나중에 통합 테스트에서 그대로 재사용할 수 있다. (study9)

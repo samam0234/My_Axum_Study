@@ -1,5 +1,6 @@
 pub mod handler;
 pub mod model;
+pub mod repo;
 
 use axum::{Router, routing::get};
 

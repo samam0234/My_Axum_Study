@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 use validator::Validate;
 
-/// 게시글 엔티티. 응답으로도 그대로 나가므로 `Serialize`가 필요하다.
+/// API 응답으로 나가는 게시글.
 #[derive(Debug, Clone, Serialize)]
 pub struct Post {
     pub id: i64,
@@ -14,10 +15,37 @@ pub struct Post {
     pub updated_at: DateTime<Utc>,
 }
 
-/// 생성 요청 본문(DTO).
+/// DB의 `posts` 한 행을 그대로 담는 타입.
 ///
-/// - `deny_unknown_fields`: 모르는 필드가 오면 거부한다. 오타를 조용히 삼키지 않게 해준다.
-/// - `validate(...)`: 파싱 이후의 "값이 말이 되는가" 검사.
+/// `Post`와 따로 두는 이유: SQLite에는 배열 타입이 없어서 `tags`가 **JSON 문자열**로 저장된다.
+/// "DB의 모양"과 "API의 모양"이 다르므로 타입도 나누고, 경계에서 변환한다.
+#[derive(Debug, Clone, FromRow)]
+pub struct PostRow {
+    pub id: i64,
+    pub title: String,
+    pub content: String,
+    pub author: String,
+    pub tags: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<PostRow> for Post {
+    fn from(row: PostRow) -> Self {
+        Self {
+            id: row.id,
+            title: row.title,
+            content: row.content,
+            author: row.author,
+            // 저장된 JSON이 깨져 있어도 500을 내지 않고 빈 배열로 처리한다.
+            tags: serde_json::from_str(&row.tags).unwrap_or_default(),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+/// 생성 요청 본문(DTO).
 #[derive(Debug, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct CreatePost {
@@ -30,15 +58,12 @@ pub struct CreatePost {
     #[validate(length(min = 2, max = 20, message = "작성자는 2~20자여야 합니다"))]
     pub author: String,
 
-    /// 태그는 선택 항목. 없으면 빈 배열이 된다.
     #[serde(default)]
     #[validate(length(max = 5, message = "태그는 최대 5개까지 가능합니다"))]
     pub tags: Vec<String>,
 }
 
 /// 수정 요청 본문. 모든 필드가 `Option`이라 부분 수정이 가능하다.
-///
-/// `Option<T>` 필드에 `validate`를 달면 **`Some`일 때만** 검사한다.
 #[derive(Debug, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct UpdatePost {
