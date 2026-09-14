@@ -1,0 +1,40 @@
+# Cargo 워크스페이스.
+#
+# demo/는 크레이트 하나에 모든 모듈을 담았다. 여기서는 **크레이트 자체를 쪼갠다.**
+# - domain: 비즈니스 규칙과 DB. HTTP를 전혀 모른다.
+# - web:    HTTP 표현 계층. domain을 의존한다.
+#
+# 의존 방향이 web → domain 한 방향으로 강제되므로,
+# "서비스 코드에 실수로 StatusCode가 섞여 들어가는" 일이 **컴파일 단계에서** 불가능해진다.
+[workspace]
+resolver = "3"
+members = ["crates/domain", "crates/web"]
+
+# 버전을 워크스페이스 한곳에서 관리한다. 크레이트가 늘어나도 버전이 어긋나지 않는다.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+argon2 = "0.6.0"
+axum = "0.8.9"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
+jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
+sea-orm = { version = "1.1", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-chrono"] }
+sea-orm-migration = { version = "1.1", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal", "fs"] }
+tower = "0.5.3"
+tower-http = { version = "0.7.1", features = ["fs", "trace", "compression-gzip"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+validator = { version = "0.21.0", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

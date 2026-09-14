@@ -1,0 +1,16 @@
+[package]
+name = "domain"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+chrono.workspace = true
+sea-orm.workspace = true
+sea-orm-migration.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+validator.workspace = true
