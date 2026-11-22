@@ -4,7 +4,7 @@
 
 | 항목 | 내용 |
 |---|---|
-| 관련 코드 | 단위: [demo/src/pagination.rs](demo/src/pagination.rs) 하단, 요청 테스트: [demo/tests/api.rs](demo/tests/api.rs), mock: [lab/src/mock_demo.rs](lab/src/mock_demo.rs) |
+| 관련 코드 | 단계 예제 [lab/examples/s09_testing.rs](lab/examples/s09_testing.rs)(포트 3009), 실제 프로젝트: 단위: [demo/src/pagination.rs](demo/src/pagination.rs) 하단, 요청 테스트: [demo/tests/api.rs](demo/tests/api.rs), mock: [lab/src/mock_demo.rs](lab/src/mock_demo.rs) |
 | 실행 결과 | `demo`: 단위 12 + 통합 31 통과(약 1.6초). `lab`: mock 테스트 3 + 서명 검증 3 + 프롬프트/스트림 3 통과 |
 
 ---
@@ -53,6 +53,250 @@ Rust는 단위 테스트를 **테스트 대상과 같은 파일**에 둔다. `#[
 ---
 
 ## ③ 🛠️ 실기
+
+### 3-0. 단계 예제 — [lab/examples/s09_testing.rs](lab/examples/s09_testing.rs) (포트 3009)
+
+이 단계의 예제는 **시험 코드 그 자체**다. 일부러 단순하게 만든 메모(memo) API를 대상으로, 같은 파일의 단위 시험, 서버를 띄우지 않는 `oneshot` 요청 시험, 시험마다 새 상태(격리), 상태를 바꿔 만드는 `test_app_with`를 보인다. DB·외부 API를 가짜로 바꾸는 trait 경계는 [lab/src/mock_demo.rs](lab/src/mock_demo.rs)(아래 3-3), 실제 프로젝트의 시험은 `demo/tests/api.rs`다.
+
+```powershell
+cd lab
+cargo test --example s09_testing                  # 시험만
+cargo test --example s09_testing -- --nocapture   # println!/로그를 그대로 본다
+cargo run --example s09_testing                   # 같은 app()을 실제 서버로 (포트 3009)
+```
+
+```rust
+//! study9 — 테스트 · 디버깅. 포트 3009.
+//!
+//! 한 단계에서 배우는 것만 담았다: 같은 파일의 **단위 테스트**, 서버를 띄우지 않는 **`oneshot` 요청 테스트**,
+//! 시험마다 새 상태(격리), 상태를 조금 바꿔 만드는 `test_app_with`, 실패를 읽는 법(`--nocapture`, 한글 시험 이름).
+//! 이 파일의 대상은 일부러 단순하게 만든 "메모(memo)" API다. (DB·외부 API를 가짜로 바꾸는 trait 경계는 src/mock_demo.rs)
+//!
+//! 실행:   cargo run --example s09_testing
+//! 시험:   cargo test --example s09_testing                 # 이 파일의 시험만
+//!         cargo test --example s09_testing -- --nocapture  # println!/로그를 그대로 본다
+
+use std::sync::{Arc, Mutex};
+
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::get,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+// ── 순수 함수: 가장 싸게 시험할 수 있는 부분은 따로 뺀다 ───────────────────────────
+/// 전체 건수와 한 페이지 크기로 페이지 수를 구한다. 올림 나눗셈이다.
+fn total_pages(total: u64, limit: u64) -> u64 {
+    total.div_ceil(limit.max(1)) // limit가 0이어도 0으로 나누지 않는다 — 경계값은 시험에서 꼭 확인한다
+}
+
+// ── 앱 ─────────────────────────────────────────────────────────────────────
+#[derive(Clone, Default)]
+struct AppState {
+    memos: Arc<Mutex<Vec<Memo>>>,
+    max_len: usize, // 시험에서 바꿔 끼울 수 있는 설정
+}
+
+#[derive(Clone, Serialize)]
+struct Memo {
+    id: usize,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct NewMemo {
+    text: String,
+}
+
+enum AppError {
+    TooLong(usize),
+    NotFound(usize),
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, code, message) = match self {
+            Self::TooLong(max) => (StatusCode::BAD_REQUEST, "VALIDATION_ERROR", format!("메모는 {max}자 이하여야 합니다")),
+            Self::NotFound(id) => (StatusCode::NOT_FOUND, "NOT_FOUND", format!("메모 {id}을(를) 찾을 수 없습니다")),
+        };
+        (status, Json(json!({ "error": { "code": code, "message": message } }))).into_response()
+    }
+}
+
+async fn create(State(state): State<AppState>, Json(body): Json<NewMemo>) -> Result<impl IntoResponse, AppError> {
+    if body.text.chars().count() > state.max_len {
+        return Err(AppError::TooLong(state.max_len));
+    }
+    let mut memos = state.memos.lock().unwrap();
+    let memo = Memo { id: memos.len() + 1, text: body.text };
+    memos.push(memo.clone());
+    Ok((StatusCode::CREATED, Json(json!({ "data": memo }))))
+}
+
+async fn get_one(State(state): State<AppState>, Path(id): Path<usize>) -> Result<Json<serde_json::Value>, AppError> {
+    let memos = state.memos.lock().unwrap();
+    let memo = memos.iter().find(|m| m.id == id).ok_or(AppError::NotFound(id))?;
+    Ok(Json(json!({ "data": memo })))
+}
+
+async fn list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let memos = state.memos.lock().unwrap();
+    Json(json!({ "data": *memos, "meta": { "total": memos.len(), "totalPages": total_pages(memos.len() as u64, 10) } }))
+}
+
+/// main과 테스트가 **같은 `app()`** 을 쓴다. (lib + bin 구조를 단일 파일에서 흉내 낸 것)
+fn app(state: AppState) -> Router {
+    Router::new()
+        .route("/api/memos", get(list).post(create))
+        .route("/api/memos/{id}", get(get_one))
+        .with_state(state)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3009").await?;
+    println!("s09_testing  http://127.0.0.1:3009/api/memos");
+    axum::serve(listener, app(AppState { max_len: 20, ..Default::default() })).await?;
+    Ok(())
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 시험은 같은 파일 안에 둔다. #[cfg(test)]라서 일반 빌드에는 포함되지 않고, 비공개 항목에도 접근한다.
+// ───────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, header},
+    };
+    use http_body_util::BodyExt;
+    use tower::ServiceExt; // oneshot
+
+    // ── 단위 시험: 함수 이름을 한글 문장으로 쓰면 실패 로그가 곧 명세서가 된다 ──
+    #[test]
+    fn 페이지_수는_올림_계산이다() {
+        assert_eq!(total_pages(25, 10), 3); // 2.5가 아니라 3
+        assert_eq!(total_pages(30, 10), 3);
+        assert_eq!(total_pages(0, 10), 0); // 경계값: 결과 없음
+        assert_eq!(total_pages(5, 0), 5); // 경계값: limit 0이어도 패닉하지 않는다
+    }
+
+    // ── 요청 시험 헬퍼: (상태 코드, JSON)만 돌려주면 대부분의 시험이 한 줄로 끝난다 ──
+    fn test_app() -> Router {
+        // 시험마다 새 상태를 만든다 → 서로 간섭하지 않고 병렬로 돌아간다
+        app(AppState { max_len: 20, ..Default::default() })
+    }
+
+    /// 상태를 조금 바꿔서 앱을 만든다. (예: 길이 제한을 줄인다)
+    fn test_app_with(tweak: impl FnOnce(AppState) -> AppState) -> Router {
+        app(tweak(AppState { max_len: 20, ..Default::default() }))
+    }
+
+    async fn request(app: &Router, method: &str, uri: &str, body: Option<serde_json::Value>) -> (StatusCode, serde_json::Value) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        let body = match body {
+            Some(json) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                Body::from(json.to_string())
+            }
+            None => Body::empty(),
+        };
+        // oneshot은 서비스를 소비한다. Router의 Clone은 싸니 복제해서 넘긴다. 서버도 포트도 필요 없다.
+        let response = app.clone().oneshot(builder.body(body).unwrap()).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes(); // 본문은 스트림이라 끝까지 모은다
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    // ── 요청 시험: 한 줄이 한 가지 약속이다 ──
+    #[tokio::test]
+    async fn 메모를_만들면_201과_data로_돌아온다() {
+        let app = test_app();
+        let (status, body) = request(&app, "POST", "/api/memos", Some(json!({ "text": "첫 메모" }))).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["data"]["id"], 1);
+        assert_eq!(body["data"]["text"], "첫 메모");
+    }
+
+    #[tokio::test]
+    async fn 없는_메모는_404_json이다() {
+        let (status, body) = request(&test_app(), "GET", "/api/memos/999", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn 길이_제한은_상태를_바꿔서_시험한다() {
+        let app = test_app_with(|s| AppState { max_len: 3, ..s });
+        let (status, body) = request(&app, "POST", "/api/memos", Some(json!({ "text": "네글자!" }))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+        // 경계값: 정확히 3자는 통과한다
+        let (status, _) = request(&app, "POST", "/api/memos", Some(json!({ "text": "세글자" }))).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn 시험마다_상태가_격리된다() {
+        let a = test_app();
+        request(&a, "POST", "/api/memos", Some(json!({ "text": "a" }))).await;
+        // 다른 앱(다른 시험)에는 보이지 않는다
+        let (_, body) = request(&test_app(), "GET", "/api/memos", None).await;
+        assert_eq!(body["meta"]["total"], 0);
+        let (_, body) = request(&a, "GET", "/api/memos", None).await;
+        assert_eq!((body["meta"]["total"].as_u64(), body["meta"]["totalPages"].as_u64()), (Some(1), Some(1)));
+    }
+
+    #[tokio::test]
+    async fn 깨진_json은_서버가_아니라_extractor가_400으로_막는다() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/memos")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{bad"))
+            .unwrap();
+        let response = test_app().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST); // 핸들러는 호출되지도 않았다
+    }
+}
+```
+
+| 코드 | 설명 |
+|---|---|
+| `fn total_pages(total, limit)` | **순수 함수는 따로 뺀다.** 가장 싸게 시험할 수 있는 부분이다. 올림 나눗셈이고 `limit.max(1)`로 0으로 나누지 않는다 |
+| `페이지_수는_올림_계산이다` | 함수 이름을 **한글 문장**으로 쓰면 실패 로그가 곧 명세서가 된다. 경계값(0건, `limit` 0)을 꼭 넣는다 — 버그는 경계에서 난다 |
+| `fn app(state) -> Router` | **main과 시험이 같은 `app()`을 호출**한다. 시험이 운영과 다른 앱을 시험하면 의미가 없다 |
+| `#[cfg(test)] mod tests` | 시험을 같은 파일에 둔다. 일반 빌드에는 포함되지 않고, 비공개 항목에도 접근할 수 있다 |
+| `test_app()` | 시험마다 **새 상태**를 만든다 → 서로 간섭하지 않고 병렬로 돌아간다 |
+| `test_app_with(\|s\| …)` | 상태를 조금 바꿔 만든다. 설정에 따라 달라지는 동작(길이 제한, 호출 제한, CORS)을 시험하는 방법 |
+| `app.clone().oneshot(request)` | **서버도 포트도 없이** 라우터에 요청을 직접 넣는다. `oneshot`은 서비스를 **소비**하므로 `Router`(Clone이 싸다)를 복제해 넘긴다. `use tower::ServiceExt;` 필요 |
+| `.collect().await.to_bytes()` | 응답 본문은 스트림이다. `http_body_util::BodyExt`로 끝까지 모은다 |
+| `request()`가 `(StatusCode, Value)`만 돌려줌 | 대부분의 시험이 "상태 코드 + JSON 필드 몇 개"만 보면 되므로 헬퍼로 줄인다 |
+| `길이_제한은_상태를_바꿔서_시험한다` | 경계값(정확히 3자는 통과, 4자는 거절)을 **둘 다** 확인 |
+| `깨진_json은_…_400으로_막는다` | 핸들러가 호출되지도 않았다 — extractor 단계의 거절도 요청 시험으로 확인된다 |
+
+**실행 결과** (직접 실행한 결과):
+
+```
+$ cargo test --example s09_testing
+running 6 tests
+test tests::페이지_수는_올림_계산이다 ... ok
+test tests::없는_메모는_404_json이다 ... ok
+test tests::메모를_만들면_201과_data로_돌아온다 ... ok
+test tests::깨진_json은_서버가_아니라_extractor가_400으로_막는다 ... ok
+test tests::길이_제한은_상태를_바꿔서_시험한다 ... ok
+test tests::시험마다_상태가_격리된다 ... ok
+test result: ok. 6 passed; 0 failed; finished in 0.00s
+```
+
+서버를 띄우지 않으니 포트 충돌이 없고 병렬로 돌아서 **6개가 0.00초**다. 같은 방식의 실제 프로젝트 시험은 `demo` 31개가 1.6초.
+
+아래 3-1부터는 이 개념이 실제 프로젝트(`demo/`)에서 어떤 모양이 되는지 이어서 본다.
 
 ### 3-1. 단위 테스트 — [demo/src/pagination.rs](demo/src/pagination.rs)
 
@@ -339,6 +583,7 @@ CI(study16)에서는 `cargo test`가 **서버·네트워크 없이** 돌아야 �
 1. **시험 먼저 쓰기**: `GET /api/posts?page=0`이 400 `VALIDATION_ERROR`와 `fields.page`를 주는 시험을 **먼저** 쓰고 실패(빨강)를 확인한 뒤, 통과(초록)하는지 본다. 이미 통과한다면 왜 통과하는지 `PageQuery`의 `validate`에서 찾는다.
 2. **`FakeNotifier` 활용**: `lab/src/mock_demo.rs`에 "알림 메시지에 수량이 0이면 안 나간다" 같은 규칙을 하나 추가하고, `fail: true`와 정상 두 경로를 시험한다.
 3. **`RUST_LOG=axum::rejection=trace`**: 서버를 띄우고 잘못된 JSON을 보내 거절 이유가 로그에 찍히는 것을 확인한다. 같은 요청이 응답에서는 어떻게 보이는지 비교한다.
+4. **단계 예제로 실험**: `s09_testing`에 `DELETE /api/memos/{id}`를 **시험부터** 쓴다(없는 id는 404, 지운 뒤 목록에서 사라짐). 빨강을 확인한 다음 핸들러를 구현해 초록으로 만든다.
 
 ---
 
@@ -354,6 +599,7 @@ CI(study16)에서는 `cargo test`가 **서버·네트워크 없이** 돌아야 �
 - ☐ 오류 TOP 10 중 증상을 보고 원인을 말할 수 있는 것이 8개 이상이다
 - ☐ trait 경계 + 가짜 구현으로 DB·외부 API를 갈아 끼우는 코드를 직접 만들어 봤다
 - ☐ 가짜가 현실을 단순화해서 생기는 위험(예: `LIKE` 대소문자)을 안다
+- ☐ `cargo test --example s09_testing -- --nocapture`로 단위·요청 시험이 서버 없이 0.00초에 도는 것을 직접 확인했다
 
 ---
 
