@@ -4,7 +4,7 @@
 
 | 항목 | 내용 |
 |---|---|
-| 관련 코드 | [demo/src/auth/](demo/src/auth/) (`password.rs`, `jwt.rs`, `extractor.rs`, `handler.rs`), [demo/src/posts/handler.rs](demo/src/posts/handler.rs) (`ensure_owner`), 쿠키 방식: [project/crates/web/src/auth.rs](project/crates/web/src/auth.rs) |
+| 관련 코드 | 단계 예제 [lab/examples/s07_auth.rs](lab/examples/s07_auth.rs)(포트 3007), 실제 프로젝트: [demo/src/auth/](demo/src/auth/) (`password.rs`, `jwt.rs`, `extractor.rs`, `handler.rs`), [demo/src/posts/handler.rs](demo/src/posts/handler.rs) (`ensure_owner`), 쿠키 방식: [project/crates/web/src/auth.rs](project/crates/web/src/auth.rs) |
 | 검증 | `demo/tests/api.rs`의 인증·인가 테스트 (토큰 없이 쓰기 401, 남의 글 수정 403, 로그인 실패 메시지 동일, 로그아웃 204, 이메일 대소문자 무시) |
 | 버전 주의 | **jsonwebtoken 11** (`rust_crypto` feature 필수), **argon2 0.6** (API 변경) |
 
@@ -64,6 +64,366 @@ JWT = `헤더.페이로드.서명`. 페이로드(`sub`, `nickname`, `iat`, `exp`
 ---
 
 ## ③ 🛠️ 실기
+
+### 3-0. 단계 예제 — [lab/examples/s07_auth.rs](lab/examples/s07_auth.rs) (포트 3007)
+
+인증·인가의 **핵심만** 한 파일에 담았다. DB 대신 메모리(`Vec`)에 저장해서 Argon2 · JWT · `AuthUser` · 401/403만 보이게 했다. DB와 합쳐진 실제 모양은 아래 3-1부터의 `demo/src/auth/`다.
+
+```powershell
+cd lab
+cargo run --example s07_auth
+$env:JWT_SECRET = "길고-무작위인-비밀키-32자-이상"; cargo run --example s07_auth    # 짧으면(16자 미만) 시작을 거부한다
+cargo test --example s07_auth                                                       # 시험 4개
+```
+
+```rust
+//! study7 — 인증 · 보안 기초. 포트 3007.
+//!
+//! 한 단계에서 배우는 것만 담았다: Argon2 해시(+ spawn_blocking), JWT 발급·검증, `AuthUser` extractor
+//! (인자에 적는 것이 곧 가드), 인증 401 vs 인가 403, 사용자 열거 방지, 이메일 정규화.
+//! DB 대신 메모리(`Vec`)에 저장해서 인증 로직만 보이게 했다. (DB를 붙인 실제 모양은 demo/src/auth/)
+//!
+//! 실행:  cargo run --example s07_auth
+//!        JWT_SECRET="길고-무작위인-비밀키-32자-이상" cargo run --example s07_auth
+
+use std::sync::{Arc, RwLock};
+
+use anyhow::Context;
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use axum::{
+    Json, Router,
+    extract::{FromRef, FromRequestParts, Path, State},
+    http::{StatusCode, request::Parts},
+    response::{IntoResponse, Response},
+    routing::{get, patch, post},
+    RequestPartsExt,
+};
+use axum_extra::{
+    TypedHeader,
+    headers::{Authorization, authorization::Bearer},
+};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode, errors::ErrorKind};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+const TOKEN_TTL_SECONDS: i64 = 60 * 60; // 1시간 (공통 API 스펙 v1 §6)
+
+// ── 상태: 사용자와 글을 메모리에 ─────────────────────────────────────────────
+#[derive(Clone)]
+struct AppState {
+    users: Arc<RwLock<Vec<User>>>,
+    posts: Arc<RwLock<Vec<Post>>>,
+    jwt_secret: Arc<String>,
+}
+
+struct User {
+    id: u64,
+    email: String,
+    nickname: String,
+    password_hash: String, // Serialize를 구현하지 않는다 → 응답에 실수로 섞여 나갈 일이 구조적으로 없다
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")] // 응답 JSON은 camelCase (author_id → authorId)
+struct Post {
+    id: u64,
+    title: String,
+    author_id: u64,
+}
+
+#[derive(Serialize)]
+struct UserPublic {
+    id: u64,
+    email: String,
+    nickname: String, // 비밀번호 해시 필드가 아예 없다
+}
+impl From<&User> for UserPublic {
+    fn from(u: &User) -> Self {
+        Self { id: u.id, email: u.email.clone(), nickname: u.nickname.clone() }
+    }
+}
+
+// ── 비밀번호: 평문이 아니라 Argon2 해시 ──────────────────────────────────────
+async fn hash_password(password: String) -> anyhow::Result<String> {
+    // Argon2는 일부러 느리다(수십 ms CPU). async 워커에서 그냥 돌리면 동시 로그인 몇 건에 서버 전체가 멈춘다
+    tokio::task::spawn_blocking(move || {
+        let hash: PasswordHash = Argon2::default() // argon2 0.6: 솔트를 알아서 만든다(1인자). 반환 타입이 제네릭이라 타입 주석 필요
+            .hash_password(password.as_bytes())
+            .map_err(|e| anyhow::anyhow!("해싱 실패: {e}"))?;
+        Ok(hash.to_string()) // $argon2id$v=19$m=19456,t=2,p=1$<솔트>$<해시> — 알고리즘·파라미터·솔트가 한 문자열에
+    })
+    .await
+    .context("해싱 태스크가 패닉했습니다")?
+}
+
+async fn verify_password(password: String, hash: String) -> anyhow::Result<bool> {
+    tokio::task::spawn_blocking(move || {
+        let parsed = PasswordHash::new(&hash).map_err(|e| anyhow::anyhow!("저장된 해시 형식 오류: {e}"))?;
+        // 불일치는 "오류"가 아니라 false. Err는 해시가 깨진 진짜 오류용
+        Ok(Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())
+    })
+    .await
+    .context("검증 태스크가 패닉했습니다")?
+}
+
+// ── JWT ────────────────────────────────────────────────────────────────────
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    sub: u64,        // subject — 사용자 id (JWT 표준 이름)
+    nickname: String, // 커스텀 클레임. 페이로드는 암호화가 아니라 base64라서 누구나 읽는다 → 비밀을 넣지 않는다
+    iat: i64,
+    exp: i64, // 만료. Validation이 자동으로 검사해 준다
+}
+
+fn encode_token(secret: &str, user: &User) -> anyhow::Result<String> {
+    let now = chrono::Utc::now().timestamp();
+    let claims = Claims { sub: user.id, nickname: user.nickname.clone(), iat: now, exp: now + TOKEN_TTL_SECONDS };
+    Ok(encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret.as_bytes()))?)
+}
+
+fn decode_token(secret: &str, token: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
+    // 허용 알고리즘을 명시한다. 토큰 헤더가 말하는 알고리즘을 그대로 믿으면 `alg: none` 공격이 가능해진다
+    decode::<Claims>(token, &DecodingKey::from_secret(secret.as_bytes()), &Validation::new(Algorithm::HS256)).map(|d| d.claims)
+}
+
+// ── 오류 ───────────────────────────────────────────────────────────────────
+#[derive(Debug, thiserror::Error)]
+enum AppError {
+    #[error("{0}")]
+    Unauthorized(String), // 토큰 없음·만료·위조 → 401
+    #[error("이메일 또는 비밀번호가 올바르지 않습니다")]
+    InvalidCredentials, // 로그인 실패 → 401. 이메일/비밀번호 중 어느 쪽인지 숨긴다
+    #[error("본인이 작성한 글만 수정/삭제할 수 있습니다")]
+    Forbidden, // 인가 실패 → 403
+    #[error("이미 사용 중인 이메일입니다")]
+    EmailTaken, // → 409
+    #[error("글 {0}을(를) 찾을 수 없습니다")]
+    NotFound(u64),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, code) = match &self {
+            Self::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "UNAUTHORIZED"),
+            Self::InvalidCredentials => (StatusCode::UNAUTHORIZED, "INVALID_CREDENTIALS"),
+            Self::Forbidden => (StatusCode::FORBIDDEN, "FORBIDDEN"),
+            Self::EmailTaken => (StatusCode::CONFLICT, "EMAIL_TAKEN"),
+            Self::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
+            Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
+        };
+        let message = if let Self::Internal(e) = &self {
+            eprintln!("internal error: {e:?}"); // 원인은 로그에만
+            "서버 내부 오류가 발생했습니다.".to_string()
+        } else {
+            self.to_string()
+        };
+        (status, Json(json!({ "error": { "code": code, "message": message } }))).into_response()
+    }
+}
+
+// ── ⭐ AuthUser: 이게 Guard 자리다. 인자에 적는 것이 곧 보호 ─────────────────────
+#[derive(Debug, Clone)]
+struct AuthUser {
+    id: u64,
+    nickname: String,
+}
+
+impl<S> FromRequestParts<S> for AuthUser
+where
+    AppState: FromRef<S>, // "상태 S에서 AppState를 꺼낼 수 있으면 된다"
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        // 1) Authorization: Bearer <토큰>. 형식 검사를 TypedHeader에 맡긴다 (문자열을 직접 자르지 않는다)
+        let TypedHeader(Authorization(bearer)) = parts
+            .extract::<TypedHeader<Authorization<Bearer>>>()
+            .await
+            .map_err(|_| AppError::Unauthorized("Authorization 헤더에 Bearer 토큰이 필요합니다".into()))?;
+
+        let app_state = AppState::from_ref(state);
+
+        // 2) 서명 + 만료 검증. 만료와 위조를 다른 문구로 알려 프론트가 "다시 로그인"을 안내할 수 있다
+        let claims = decode_token(&app_state.jwt_secret, bearer.token()).map_err(|e| match e.kind() {
+            ErrorKind::ExpiredSignature => AppError::Unauthorized("토큰이 만료되었습니다".into()),
+            _ => AppError::Unauthorized("토큰이 유효하지 않습니다".into()),
+        })?;
+
+        Ok(AuthUser { id: claims.sub, nickname: claims.nickname })
+    }
+}
+
+// ── 핸들러 ─────────────────────────────────────────────────────────────────
+#[derive(Deserialize)]
+struct Signup {
+    email: String,
+    password: String,
+    nickname: String,
+}
+#[derive(Deserialize)]
+struct Login {
+    email: String,
+    password: String,
+}
+#[derive(Deserialize)]
+struct NewPost {
+    title: String,
+}
+
+fn normalize_email(email: &str) -> String {
+    email.trim().to_lowercase() // 같은 사람이 대소문자만 바꿔 두 계정을 만들지 못하게
+}
+
+async fn signup(State(state): State<AppState>, Json(body): Json<Signup>) -> Result<impl IntoResponse, AppError> {
+    let email = normalize_email(&body.email);
+    if state.users.read().unwrap().iter().any(|u| u.email == email) {
+        return Err(AppError::EmailTaken);
+    }
+    let password_hash = hash_password(body.password).await?;
+    let mut users = state.users.write().unwrap();
+    // (DB라면 SELECT 후 INSERT가 아니라 UNIQUE 제약 + 위반 변환으로 한다 — 동시 요청 사이의 틈 때문)
+    let user = User { id: users.len() as u64 + 1, email, nickname: body.nickname, password_hash };
+    let public = UserPublic::from(&user);
+    users.push(user);
+    Ok((StatusCode::CREATED, Json(json!({ "data": public }))))
+}
+
+async fn login(State(state): State<AppState>, Json(body): Json<Login>) -> Result<Json<serde_json::Value>, AppError> {
+    let email = normalize_email(&body.email);
+    let found = state.users.read().unwrap().iter().find(|u| u.email == email).map(|u| (u.id, u.nickname.clone(), u.password_hash.clone()));
+
+    // ⚠️ "없는 이메일"과 "틀린 비밀번호"를 구분해서 알려 주면 안 된다. 공격자가 가입된 이메일 목록을 수집한다(user enumeration)
+    let Some((id, nickname, hash)) = found else {
+        return Err(AppError::InvalidCredentials);
+    };
+    if !verify_password(body.password, hash).await? {
+        return Err(AppError::InvalidCredentials);
+    }
+    let user = User { id, email, nickname, password_hash: String::new() };
+    let token = encode_token(&state.jwt_secret, &user)?;
+    Ok(Json(json!({ "data": { "user": UserPublic::from(&user), "accessToken": token } })))
+}
+
+/// 인자에 `AuthUser`가 있다 → 이 라우트는 보호된다. 실패하면 핸들러는 아예 호출되지 않는다.
+async fn me(user: AuthUser) -> Json<serde_json::Value> {
+    Json(json!({ "data": { "id": user.id, "nickname": user.nickname } }))
+}
+
+async fn create_post(State(state): State<AppState>, user: AuthUser, Json(body): Json<NewPost>) -> impl IntoResponse {
+    let mut posts = state.posts.write().unwrap();
+    // 작성자는 요청 본문이 아니라 토큰에서. 클라이언트가 보낸 author를 믿지 않는다
+    let post = Post { id: posts.len() as u64 + 1, title: body.title, author_id: user.id };
+    posts.push(post.clone());
+    (StatusCode::CREATED, Json(json!({ "data": post })))
+}
+
+/// 인증(누구인가)만으로는 부족하다. "이 글의 주인인가"는 데이터를 읽어야 알 수 있어서 핸들러에서 판단한다 → 403
+fn ensure_owner(posts: &[Post], id: u64, user: &AuthUser) -> Result<(), AppError> {
+    let post = posts.iter().find(|p| p.id == id).ok_or(AppError::NotFound(id))?; // 없으면 404
+    if post.author_id != user.id {
+        return Err(AppError::Forbidden); // 남의 글이면 403
+    }
+    Ok(())
+}
+
+async fn rename_post(State(state): State<AppState>, user: AuthUser, Path(id): Path<u64>, Json(body): Json<NewPost>) -> Result<Json<serde_json::Value>, AppError> {
+    let mut posts = state.posts.write().unwrap();
+    ensure_owner(&posts, id, &user)?;
+    let post = posts.iter_mut().find(|p| p.id == id).unwrap();
+    post.title = body.title;
+    Ok(Json(json!({ "data": post })))
+}
+
+fn app(state: AppState) -> Router {
+    Router::new()
+        .route("/api/auth/signup", post(signup))
+        .route("/api/auth/login", post(login))
+        .route("/api/auth/me", get(me))
+        .route("/api/posts", post(create_post))
+        .route("/api/posts/{id}", patch(rename_post))
+        .with_state(state)
+}
+
+fn new_state(secret: &str) -> AppState {
+    AppState { users: Default::default(), posts: Default::default(), jwt_secret: Arc::new(secret.to_string()) }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "dev-only-insecure-secret-change-me".into());
+    if secret.len() < 16 {
+        anyhow::bail!("JWT_SECRET이 너무 짧습니다 (최소 16자)"); // 서버가 뜬 뒤가 아니라 시작할 때 거절
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3007").await?;
+    println!("s07_auth  http://127.0.0.1:3007/api/auth/me");
+    axum::serve(listener, app(new_state(&secret))).await?;
+    Ok(())
+}
+```
+
+시험 코드는 같은 파일 아래쪽의 `#[cfg(test)] mod tests`에 있다: [s07_auth.rs](lab/examples/s07_auth.rs).
+
+| 코드 | 설명 |
+|---|---|
+| `hash_password` / `verify_password` + `spawn_blocking` | Argon2는 **일부러 느린**(수십 ms CPU) 알고리즘. async 워커에서 그냥 돌리면 동시 로그인 몇 건에 서버 전체가 멈춘다. argon2 0.6은 솔트를 알아서 만들고(1인자) 반환 타입이 제네릭이라 `let hash: PasswordHash` 주석이 필요 |
+| PHC 문자열 `$argon2id$v=19$m=…$<솔트>$<해시>` | 알고리즘·파라미터·솔트가 한 문자열에 들어 있어 검증 때 따로 보관할 것이 없다 |
+| `verify_password`가 불일치를 `false`로 | 불일치는 "오류"가 아니다. `Err`는 해시 형식이 깨진 진짜 오류용 |
+| `User.password_hash`에 `Serialize` 없음 / `UserPublic` | 응답에 해시가 **구조적으로** 섞여 나갈 수 없다 |
+| `Claims { sub, nickname, iat, exp }` | `sub`·`iat`·`exp`는 JWT 표준 이름이라 라이브러리가 만료를 자동 검사한다. 페이로드는 **암호화가 아니라 base64** → 비밀을 넣지 않는다 |
+| `Validation::new(Algorithm::HS256)` | 허용 알고리즘을 **명시**. 토큰 헤더가 말하는 알고리즘을 믿으면 `alg: none` 공격이 가능 |
+| `FromRequestParts for AuthUser` | 본문을 읽지 않는 extractor라서 인자 **위치가 자유**롭다. **핸들러 인자에 적는 것이 곧 가드**이고, 실패하면 핸들러는 아예 호출되지 않고 401이 나간다 |
+| `AppState: FromRef<S>` | "상태 `S`에서 `AppState`를 꺼낼 수 있으면 된다" — 상태 타입이 하나면 기본 구현이 맞아떨어진다 |
+| `TypedHeader<Authorization<Bearer>>` | `Bearer <토큰>` 형식 검사를 라이브러리에 맡긴다 (직접 문자열을 자르지 않는다) |
+| `ErrorKind::ExpiredSignature` 분기 | 만료와 위조를 **다른 문구**로 알려 프론트가 "다시 로그인"을 안내할 수 있게 한다. 코드는 둘 다 `UNAUTHORIZED` |
+| `login`이 두 경우 모두 `InvalidCredentials` | 없는 이메일과 틀린 비밀번호를 구분해서 알려 주면 가입된 이메일 목록이 새 나간다(user enumeration) |
+| `normalize_email` | 같은 사람이 대소문자만 바꿔 두 계정을 만들지 못하게. 저장도 조회도 소문자로 |
+| `ensure_owner` → `Forbidden` | **인증(누구인가, 401)과 인가(이걸 해도 되는가, 403)는 다른 문제.** extractor는 "누구인지"까지만 답한다. 주인인지는 데이터를 읽어야 알 수 있어서 핸들러에서 |
+| `create_post`의 `author_id: user.id` | 작성자는 요청 본문이 아니라 **토큰에서**. 클라이언트가 보낸 값을 믿지 않는다 |
+| `main`의 `JWT_SECRET.len() < 16` | 짧은 비밀키는 서버가 뜨기 전에 거부 (안전한 쪽으로 실패) |
+
+**실행 결과** (직접 실행한 결과):
+
+```
+s07_auth  http://127.0.0.1:3007/api/auth/me
+
+$ curl -X POST .../api/auth/signup -d '{"email":"Alice@Example.com","password":"supersecret123","nickname":"alice"}'
+{"data":{"id":1,"email":"alice@example.com","nickname":"alice"}}            ← 이메일은 소문자로, 비밀번호 필드는 없다
+$ ... {"email":"ALICE@example.com", ...}                                     ← 대소문자만 다른 같은 이메일
+{"error":{"code":"EMAIL_TAKEN","message":"이미 사용 중인 이메일입니다"}}
+
+$ 토큰 가운데 부분(페이로드)을 base64 디코드
+{'sub': 1, 'nickname': 'alice', 'iat': 1795373835, 'exp': 1795377435}        ← 암호화가 아니라서 그대로 읽힌다 (exp - iat = 3600)
+$ 토큰 첫 부분(헤더)                                          {'typ': 'JWT', 'alg': 'HS256'}
+
+$ curl .../api/auth/me                                          → 401 {"error":{"code":"UNAUTHORIZED","message":"Authorization 헤더에 Bearer 토큰이 필요합니다"}}
+$ curl .../api/auth/me -H "authorization: Bearer <토큰>x"        → 401 {"error":{"code":"UNAUTHORIZED","message":"토큰이 유효하지 않습니다"}}   ← 위조
+$ curl .../api/auth/me -H "authorization: Bearer <토큰>"         → 200 {"data":{"id":1,"nickname":"alice"}}
+
+$ bob의 토큰으로 alice의 글 PATCH   → 403 {"error":{"code":"FORBIDDEN","message":"본인이 작성한 글만 수정/삭제할 수 있습니다"}}
+$ alice의 토큰으로 PATCH            → 200 {"data":{"id":1,"title":"edited","authorId":1}}
+
+$ 로그인 실패: 틀린 비밀번호 / 없는 이메일
+{"error":{"code":"INVALID_CREDENTIALS","message":"이메일 또는 비밀번호가 올바르지 않습니다"}}     ← 두 응답이 완전히 같다
+{"error":{"code":"INVALID_CREDENTIALS","message":"이메일 또는 비밀번호가 올바르지 않습니다"}}
+
+$ JWT_SECRET=short cargo run --example s07_auth
+Error: JWT_SECRET이 너무 짧습니다 (최소 16자)
+```
+
+시험 (`cargo test --example s07_auth`, Argon2가 일부러 느려서 1.3초 걸린다):
+
+```
+test tests::토큰이_없거나_위조면_401이고_있으면_통과한다 ... ok
+test tests::남의_글은_403이고_로그인_실패는_두_경우가_같다 ... ok
+test tests::이메일은_소문자로_맞추고_응답에_비밀번호가_없다 ... ok
+test tests::토큰_페이로드는_암호화가_아니라_base64라서_읽힌다 ... ok      ← 비밀키 없이 페이로드가 읽히고, 다른 키로는 검증이 실패한다
+test result: ok. 4 passed
+```
+
+아래 3-1부터는 이 개념이 실제 프로젝트(`demo/`)에서 어떤 모양이 되는지 이어서 본다.
 
 ### 3-1. 비밀번호 해시 — [demo/src/auth/password.rs](demo/src/auth/password.rs)
 
@@ -354,6 +714,7 @@ pub fn session_cookie(token: &str, secure: bool) -> String {
 1. **토큰 직접 열어 보기**: 로그인으로 받은 `data.accessToken`을 `.`로 나눠 가운데 부분을 base64 디코드하면 `sub`, `nickname`, `exp`가 그대로 보인다. 왜 비밀을 넣으면 안 되는지 확인한다.
 2. **만료 실험**: `TOKEN_TTL_SECONDS`를 5초로 줄이고 로그인 → 6초 뒤 글쓰기를 호출해 `토큰이 만료되었습니다` 문구를 본다. 원래 값(3600)으로 되돌린다.
 3. **CSRF 직접 보기**: [study12](study12.md)의 `s12_front`로 쿠키를 발급받은 뒤, 다른 출처의 HTML에서 `<form method="POST" action="http://127.0.0.1:3012/api/logout">`을 제출하면 `SameSite=Lax` 때문에 쿠키가 실리는지 개발자도구 Network 탭에서 확인한다. `SameSite=None`으로 바꿨을 때와 비교한다.
+4. **단계 예제로 실험**: `s07_auth`의 `rename_post`에서 `ensure_owner` 호출 한 줄을 지우고 `cargo test --example s07_auth`를 돌려 어떤 시험이 깨지는지 본다. **인증(`AuthUser`)만 있고 인가가 빠진 코드가 얼마나 조용히 구멍이 되는지** 확인한다.
 
 ---
 
@@ -370,6 +731,7 @@ pub fn session_cookie(token: &str, secure: bool) -> String {
 - ☐ Bearer 방식과 HttpOnly 쿠키 방식의 장단점, `HttpOnly`/`SameSite`/`Secure`의 의미를 안다
 - ☐ `jsonwebtoken`에 `rust_crypto` feature가 필요한 이유와 증상을 기억한다
 - ☐ Bearer 방식의 로그아웃이 서버에서 하는 일이 없는 이유(204만 준다)와 즉시 무효화가 필요할 때의 대안을 말할 수 있다
+- ☐ `cargo run --example s07_auth`로 가입→로그인→토큰 디코드→401/403/로그인 실패 동일 응답을 직접 확인했다
 
 ---
 
