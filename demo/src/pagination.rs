@@ -2,73 +2,137 @@
 
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 fn default_page() -> u32 {
     1
 }
-fn default_per_page() -> u32 {
+fn default_limit() -> u32 {
     10
 }
 
-/// `?page=1&per_page=20&q=검색어&tag=rust` 형태의 쿼리 파라미터.
+/// 스펙이 허용하는 `limit` 상한. 이보다 크게 보내면 **오류가 아니라 이 값으로 줄인다.** (스펙 §4)
+pub const MAX_LIMIT: u32 = 50;
+
+/// `?page=1&limit=20&q=검색어&sort=-createdAt` 형태의 쿼리 파라미터. **공통 API 스펙 v1 §4**
 #[derive(Debug, Deserialize, Validate, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct PageQuery {
+    /// 1부터 센다.
     #[serde(default = "default_page")]
     #[validate(range(min = 1, message = "page는 1 이상이어야 합니다"))]
     pub page: u32,
 
-    /// 상한을 두지 않으면 `per_page=1000000`으로 서버를 괴롭힐 수 있다.
-    #[serde(default = "default_per_page")]
-    #[validate(range(min = 1, max = 100, message = "per_page는 1~100이어야 합니다"))]
-    pub per_page: u32,
+    /// 기본 10, 최대 50. 50을 넘기면 50으로 줄인다. (`effective_limit`)
+    #[serde(default = "default_limit")]
+    #[validate(range(min = 1, message = "limit는 1 이상이어야 합니다"))]
+    pub limit: u32,
 
-    /// 제목/본문 검색어 (선택)
+    /// 제목·본문 부분 일치 (대소문자 무시)
     pub q: Option<String>,
 
-    /// 태그 필터 (선택)
+    /// 정렬: `createdAt`, `-createdAt`(기본), `-commentCount`. `-`는 내림차순.
+    #[validate(custom(function = "validate_sort"))]
+    pub sort: Option<String>,
+
+    /// 태그 필터 (스펙 밖 확장)
     pub tag: Option<String>,
 }
 
+/// 허용하는 정렬 기준. 문자열을 그대로 SQL에 붙이지 않고 **enum으로 바꿔서** 고정된 SQL 조각만 쓴다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sort {
+    CreatedAtDesc,
+    CreatedAtAsc,
+    CommentCountDesc,
+}
+
+impl Sort {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "-createdAt" => Some(Self::CreatedAtDesc),
+            "createdAt" => Some(Self::CreatedAtAsc),
+            "-commentCount" => Some(Self::CommentCountDesc),
+            _ => None,
+        }
+    }
+
+    /// `ORDER BY` 뒤에 붙는 고정 문자열. (사용자 입력이 아니라 위 세 값 중 하나)
+    pub fn order_by(self) -> &'static str {
+        match self {
+            Self::CreatedAtDesc => " ORDER BY p.created_at DESC, p.id DESC",
+            Self::CreatedAtAsc => " ORDER BY p.created_at ASC, p.id ASC",
+            Self::CommentCountDesc => " ORDER BY comment_count DESC, p.created_at DESC, p.id DESC",
+        }
+    }
+}
+
+fn validate_sort(raw: &str) -> Result<(), ValidationError> {
+    if Sort::parse(raw).is_some() {
+        Ok(())
+    } else {
+        Err(ValidationError::new("sort")
+            .with_message("sort는 createdAt, -createdAt, -commentCount 중 하나여야 합니다".into()))
+    }
+}
+
 impl PageQuery {
+    /// 실제로 쓰는 개수. 상한(50)을 넘긴 값은 50으로 줄인다.
+    pub fn effective_limit(&self) -> u32 {
+        self.limit.clamp(1, MAX_LIMIT)
+    }
+
     pub fn limit(&self) -> i64 {
-        self.per_page as i64
+        self.effective_limit() as i64
     }
 
     pub fn offset(&self) -> i64 {
-        ((self.page - 1) * self.per_page) as i64
+        (self.page.saturating_sub(1) as i64) * self.effective_limit() as i64
+    }
+
+    pub fn sort(&self) -> Sort {
+        self.sort
+            .as_deref()
+            .and_then(Sort::parse)
+            .unwrap_or(Sort::CreatedAtDesc)
     }
 }
 
-/// 페이지네이션 응답 껍데기.
-///
-/// 배열을 그대로 반환하면 "전체가 몇 건인지", "다음 페이지가 있는지"를 알려줄 자리가 없다.
-// utoipa 5는 제네릭 스키마를 그대로 지원한다. (4까지 있던 #[aliases]는 제거됨)
+/// 목록 응답의 `meta`. **공통 API 스펙 v1 §3**
 #[derive(Debug, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")] // per_page → perPage, total_pages → totalPages, has_next → hasNext
-pub struct Page<T> {
-    pub items: Vec<T>,
+#[serde(rename_all = "camelCase")]
+pub struct PageMeta {
     pub page: u32,
-    pub per_page: u32,
+    pub limit: u32,
     pub total: i64,
     pub total_pages: u32,
-    pub has_next: bool,
+    /// 검색어를 그대로 돌려준다. 없으면 `null`.
+    pub q: Option<String>,
 }
 
-impl<T> Page<T> {
-    pub fn new(items: Vec<T>, query: &PageQuery, total: i64) -> Self {
-        let per_page = query.per_page.max(1);
-        // 올림 나눗셈: (total + per_page - 1) / per_page
-        let total_pages = ((total as u64 + per_page as u64 - 1) / per_page as u64) as u32;
+/// 목록 응답: `{ data: [...], meta: {...} }`
+// utoipa 5는 제네릭 스키마를 그대로 지원한다. (4까지 있던 #[aliases]는 제거됨)
+#[derive(Debug, Serialize, ToSchema)]
+pub struct Paged<T> {
+    pub data: Vec<T>,
+    pub meta: PageMeta,
+}
+
+impl<T> Paged<T> {
+    pub fn new(data: Vec<T>, query: &PageQuery, total: i64) -> Self {
+        let limit = query.effective_limit();
+        // 올림 나눗셈: (total + limit - 1) / limit
+        let total_pages = ((total as u64 + limit as u64 - 1) / limit as u64) as u32;
 
         Self {
-            items,
-            page: query.page,
-            per_page,
-            total,
-            total_pages,
-            has_next: query.page < total_pages,
+            data,
+            meta: PageMeta {
+                page: query.page,
+                limit,
+                total,
+                total_pages,
+                q: query.q.clone().filter(|s| !s.trim().is_empty()),
+            },
         }
     }
 }
@@ -84,11 +148,12 @@ impl<T> Page<T> {
 mod tests {
     use super::*;
 
-    fn query(page: u32, per_page: u32) -> PageQuery {
+    fn query(page: u32, limit: u32) -> PageQuery {
         PageQuery {
             page,
-            per_page,
+            limit,
             q: None,
+            sort: None,
             tag: None,
         }
     }
@@ -103,32 +168,46 @@ mod tests {
     #[test]
     fn total_pages는_올림_계산이다() {
         // 25건을 10개씩 → 3페이지 (2.5가 아니라)
-        let page = Page::new(Vec::<i32>::new(), &query(1, 10), 25);
-        assert_eq!(page.total_pages, 3);
-        assert!(page.has_next);
-    }
-
-    #[test]
-    fn 마지막_페이지에서는_has_next가_false다() {
-        let page = Page::new(Vec::<i32>::new(), &query(3, 10), 25);
-        assert_eq!(page.total_pages, 3);
-        assert!(!page.has_next);
+        let page = Paged::new(Vec::<i32>::new(), &query(1, 10), 25);
+        assert_eq!(page.meta.total_pages, 3);
     }
 
     #[test]
     fn 결과가_없으면_total_pages는_0이다() {
-        let page = Page::new(Vec::<i32>::new(), &query(1, 10), 0);
-        assert_eq!(page.total_pages, 0);
-        assert!(!page.has_next);
+        let page = Paged::new(Vec::<i32>::new(), &query(1, 10), 0);
+        assert_eq!(page.meta.total_pages, 0);
+    }
+
+    #[test]
+    fn limit이_50을_넘으면_50으로_줄인다() {
+        let q = query(1, 1000);
+        assert_eq!(q.effective_limit(), 50);
+        assert_eq!(Paged::new(Vec::<i32>::new(), &q, 120).meta.limit, 50);
+        // 줄인 값으로 offset도 계산한다
+        assert_eq!(query(2, 1000).offset(), 50);
     }
 
     #[test]
     fn 검증_규칙이_범위를_막는다() {
-        use validator::Validate;
-
         assert!(query(1, 10).validate().is_ok());
         assert!(query(0, 10).validate().is_err()); // page >= 1
-        assert!(query(1, 0).validate().is_err()); // per_page >= 1
-        assert!(query(1, 101).validate().is_err()); // per_page <= 100
+        assert!(query(1, 0).validate().is_err()); // limit >= 1
+    }
+
+    #[test]
+    fn sort는_허용한_값만_받는다() {
+        let mut q = query(1, 10);
+        assert_eq!(q.sort(), Sort::CreatedAtDesc); // 기본값
+        for (raw, want) in [
+            ("createdAt", Sort::CreatedAtAsc),
+            ("-createdAt", Sort::CreatedAtDesc),
+            ("-commentCount", Sort::CommentCountDesc),
+        ] {
+            q.sort = Some(raw.into());
+            assert!(q.validate().is_ok());
+            assert_eq!(q.sort(), want);
+        }
+        q.sort = Some("title; DROP TABLE posts".into());
+        assert!(q.validate().is_err());
     }
 }

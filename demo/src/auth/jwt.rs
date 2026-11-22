@@ -14,19 +14,19 @@ pub const TOKEN_TTL_SECONDS: i64 = 60 * 60; // 1시간
 pub struct Claims {
     /// subject — 사용자 id
     pub sub: i64,
-    /// 사용자 이름 (커스텀 클레임)
-    pub username: String,
+    /// 닉네임 (커스텀 클레임)
+    pub nickname: String,
     /// issued at — 발급 시각 (Unix epoch 초)
     pub iat: i64,
     /// expiration — 만료 시각 (Unix epoch 초)
     pub exp: i64,
 }
 
-pub fn encode_token(secret: &str, user_id: i64, username: &str) -> anyhow::Result<String> {
+pub fn encode_token(secret: &str, user_id: i64, nickname: &str) -> anyhow::Result<String> {
     let now = chrono::Utc::now().timestamp();
     let claims = Claims {
         sub: user_id,
-        username: username.to_string(),
+        nickname: nickname.to_string(),
         iat: now,
         exp: now + TOKEN_TTL_SECONDS,
     };

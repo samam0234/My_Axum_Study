@@ -34,21 +34,25 @@ pub enum AppError {
     #[error("{0}")]
     Unauthorized(String),
 
-    /// 로그인 실패 → 401 `INVALID_CREDENTIALS` (아이디/비밀번호 어느 쪽이 틀렸는지 숨긴다)
-    #[error("아이디 또는 비밀번호가 올바르지 않습니다")]
+    /// 로그인 실패 → 401 `INVALID_CREDENTIALS` (이메일/비밀번호 어느 쪽이 틀렸는지 숨긴다)
+    #[error("이메일 또는 비밀번호가 올바르지 않습니다")]
     InvalidCredentials,
 
     /// 권한 없음 → 403 `FORBIDDEN` (소유권 검사)
     #[error("{0}")]
     Forbidden(String),
 
-    /// 아이디·이메일 중복 → 409 `EMAIL_TAKEN`
-    #[error("이미 사용 중인 아이디 또는 이메일입니다")]
+    /// 이메일 중복 → 409 `EMAIL_TAKEN`
+    #[error("이미 사용 중인 이메일입니다")]
     EmailTaken,
 
     /// 그 밖의 상태 충돌 → 409 `CONFLICT`
     #[error("{0}")]
     Conflict(String),
+
+    /// 호출 제한 초과 → 429 `RATE_LIMITED` (+ `Retry-After` 헤더)
+    #[error("요청이 너무 많습니다. 잠시 후 다시 시도하세요.")]
+    RateLimited { retry_after: u64 },
 
     /// 경로는 있는데 메서드가 다름 → 405 `METHOD_NOT_ALLOWED`
     #[error("이 경로에서 지원하지 않는 HTTP 메서드입니다")]
@@ -123,6 +127,7 @@ impl AppError {
             Self::Unauthorized(_) | Self::InvalidCredentials => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::EmailTaken | Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::Database(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -143,6 +148,7 @@ impl AppError {
             Self::Forbidden(_) => "FORBIDDEN",
             Self::EmailTaken => "EMAIL_TAKEN",
             Self::Conflict(_) => "CONFLICT",
+            Self::RateLimited { .. } => "RATE_LIMITED",
             Self::MethodNotAllowed => "METHOD_NOT_ALLOWED",
             Self::Database(_) | Self::Internal(_) => "INTERNAL",
         }
@@ -172,7 +178,14 @@ impl IntoResponse for AppError {
             envelope.error.fields = Some(flatten_validation_errors(errors));
         }
 
-        (status, Json(envelope)).into_response()
+        let mut response = (status, Json(envelope)).into_response();
+        if let Self::RateLimited { retry_after } = &self {
+            // 클라이언트가 언제 다시 시도하면 되는지 알려 주는 표준 헤더
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, (*retry_after).into());
+        }
+        response
     }
 }
 

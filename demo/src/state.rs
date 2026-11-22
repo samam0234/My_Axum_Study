@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::db::DbPool;
+use crate::ratelimit::RateLimiter;
 
 /// 앱 전역에서 공유되는 상태.
 ///
@@ -13,7 +14,14 @@ pub struct AppState {
     pub jwt_secret: Arc<String>,
     /// 업로드 파일을 저장할 폴더. (study9에서 설정으로 분리)
     pub upload_dir: Arc<String>,
+    /// 허용할 CORS 출처. 쉼표로 여러 개. (`CORS_ORIGIN`, 스펙 §7)
+    pub cors_origin: Arc<String>,
+    /// 호출 제한. 기본은 제한 없음. (`RATE_LIMIT_PER_MINUTE`)
+    pub rate_limiter: Arc<RateLimiter>,
 }
+
+/// 스펙이 정한 개발용 기본 출처.
+pub const DEFAULT_CORS_ORIGIN: &str = "http://localhost:5173";
 
 impl AppState {
     pub fn new(db: DbPool, jwt_secret: String, upload_dir: String) -> Self {
@@ -21,6 +29,20 @@ impl AppState {
             db,
             jwt_secret: Arc::new(jwt_secret),
             upload_dir: Arc::new(upload_dir),
+            cors_origin: Arc::new(DEFAULT_CORS_ORIGIN.to_string()),
+            rate_limiter: Arc::new(RateLimiter::disabled()),
         }
+    }
+
+    /// 설정으로 CORS 출처를 바꾼다. (빌더 스타일: 기본값만 쓰는 호출자는 `new`만 쓰면 된다)
+    pub fn with_cors_origin(mut self, origin: String) -> Self {
+        self.cors_origin = Arc::new(origin);
+        self
+    }
+
+    /// 분당 허용 횟수. `0`이면 제한하지 않는다.
+    pub fn with_rate_limit_per_minute(mut self, limit: u32) -> Self {
+        self.rate_limiter = Arc::new(RateLimiter::new(limit, std::time::Duration::from_secs(60)));
+        self
     }
 }

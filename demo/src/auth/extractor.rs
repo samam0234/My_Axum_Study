@@ -33,7 +33,7 @@ use crate::state::AppState;
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub id: i64,
-    pub username: String,
+    pub nickname: String,
 }
 
 impl<S> FromRequestParts<S> for AuthUser
@@ -71,7 +71,7 @@ where
 
         Ok(AuthUser {
             id: claims.sub,
-            username: claims.username,
+            nickname: claims.nickname,
         })
     }
 }

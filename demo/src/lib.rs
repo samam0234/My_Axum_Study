@@ -4,6 +4,7 @@
 //! 앱 조립 로직을 라이브러리 크레이트에 둔다. 이게 Rust 프로젝트의 표준 구조다.
 
 pub mod auth;
+pub mod comments;
 pub mod config;
 pub mod db;
 pub mod error;
@@ -12,6 +13,8 @@ pub mod middleware;
 pub mod openapi;
 pub mod pagination;
 pub mod posts;
+pub mod ratelimit;
+pub mod response;
 pub mod routes;
 pub mod state;
 pub mod upload;
@@ -55,11 +58,23 @@ pub fn init_tracing() {
 pub fn app(state: AppState) -> Router {
     // Arc<String> → String (ServeDir은 AsRef<Path>를 요구한다)
     let upload_dir = state.upload_dir.as_str().to_string();
+    let cors = cors_layer(&state.cors_origin);
+
+    // 공통 API 스펙 v1: 모든 업무 API는 `/api` 아래에 있다. (헬스 체크 `/health`만 접두어 없이)
+    // 호출 제한은 이 라우터에만 건다. 헬스 체크나 정적 파일이 제한에 걸려 배포가 실패하면 곤란하다.
+    let api = Router::new()
+        .nest("/auth", auth::router())
+        .nest("/posts", posts::router())
+        .nest("/comments", comments::router())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            ratelimit::rate_limit,
+        ));
 
     Router::new()
-        // Swagger UI: http://127.0.0.1:3000/docs
+        // Swagger UI: http://127.0.0.1:3000/api-docs/
         // OpenAPI JSON: http://127.0.0.1:3000/api-docs/openapi.json
-        .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", openapi::ApiDoc::openapi()))
+        .merge(SwaggerUi::new("/api-docs").url("/api-docs/openapi.json", openapi::ApiDoc::openapi()))
         .route("/", get(routes::root))
         .route("/health", get(routes::health))
         .route("/hello/{name}", get(routes::hello))
@@ -67,10 +82,8 @@ pub fn app(state: AppState) -> Router {
         .route("/boom", get(routes::boom))
         .route("/panic", get(routes::panic_handler))
         .route("/slow", get(routes::slow))
-        // 게시판 라우터를 /posts 아래에 장착한다.
-        .nest("/posts", posts::router())
-        // 인증 라우터
-        .nest("/auth", auth::router())
+        // 스펙 v1 경로: /api/auth/*, /api/posts/*, /api/comments/*
+        .nest("/api", api)
         // 업로드된 파일을 정적으로 서빙한다. (study8)
         // ServeDir은 Router가 아니라 tower Service라서 nest_service를 쓴다.
         .nest_service("/uploads", ServeDir::new(upload_dir))
@@ -110,18 +123,26 @@ pub fn app(state: AppState) -> Router {
                     middleware::REQUEST_TIMEOUT,
                 ))
                 // 9. CORS
-                .layer(cors_layer())
+                .layer(cors)
                 // 10. 요청 본문 크기 제한 — 가장 안쪽
                 .layer(DefaultBodyLimit::max(middleware::BODY_LIMIT_BYTES)),
         )
 }
 
-/// CORS 설정.
+/// CORS 설정. 허용 출처는 환경변수 `CORS_ORIGIN`(쉼표로 여러 개)에서 온다. (스펙 §7)
 ///
 /// `CorsLayer::permissive()`는 편하지만 **운영에서 쓰면 안 된다.**
-fn cors_layer() -> CorsLayer {
+/// 값이 헤더로 쓸 수 없는 문자열이면 건너뛴다. (`Config::from_env`가 시작할 때 이미 걸러 준다)
+fn cors_layer(origins: &str) -> CorsLayer {
+    let origins: Vec<HeaderValue> = origins
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+
     CorsLayer::new()
-        .allow_origin("http://localhost:5173".parse::<HeaderValue>().unwrap())
+        .allow_origin(origins)
         .allow_methods([
             Method::GET,
             Method::POST,

@@ -21,7 +21,9 @@ async fn main() -> anyhow::Result<()> {
 
     upload::ensure_dir(&config.upload_dir).await?;
 
-    let state = AppState::new(pool, config.jwt_secret.clone(), config.upload_dir.clone());
+    let state = AppState::new(pool, config.jwt_secret.clone(), config.upload_dir.clone())
+        .with_cors_origin(config.cors_origin.clone())
+        .with_rate_limit_per_minute(config.rate_limit_per_minute);
     let app = app(state);
 
     // 0.7부터 hyper Server가 아니라 tokio TcpListener + axum::serve 조합을 쓴다.
@@ -29,7 +31,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(addr = %listener.local_addr()?, "listening");
 
     // Ctrl+C를 받으면 진행 중인 요청을 마치고 종료한다 (graceful shutdown).
-    axum::serve(listener, app)
+    // `ConnectInfo`를 켜야 호출 제한 미들웨어가 요청자의 IP를 볼 수 있다.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 

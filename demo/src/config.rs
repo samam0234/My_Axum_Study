@@ -6,6 +6,8 @@
 
 use anyhow::Context;
 
+use crate::state::DEFAULT_CORS_ORIGIN;
+
 /// DB를 지정하지 않았을 때의 기본값. 빌드한 feature에 따라 달라진다.
 #[cfg(feature = "sqlite")]
 const DEFAULT_DATABASE_URL: &str = "sqlite://data.db?mode=rwc";
@@ -21,6 +23,10 @@ pub struct Config {
     pub jwt_secret: String,
     pub bind_addr: String,
     pub upload_dir: String,
+    /// 허용할 CORS 출처(쉼표로 여러 개). 스펙 §7의 `CORS_ORIGIN`.
+    pub cors_origin: String,
+    /// IP당 분당 허용 요청 수. `0`이면 제한하지 않는다.
+    pub rate_limit_per_minute: u32,
 }
 
 impl Config {
@@ -33,6 +39,10 @@ impl Config {
             jwt_secret: env_or("JWT_SECRET", DEV_JWT_SECRET),
             bind_addr: env_or("BIND_ADDR", "127.0.0.1:3000"),
             upload_dir: env_or("UPLOAD_DIR", "uploads"),
+            cors_origin: env_or("CORS_ORIGIN", DEFAULT_CORS_ORIGIN),
+            rate_limit_per_minute: env_or("RATE_LIMIT_PER_MINUTE", "300")
+                .parse()
+                .context("RATE_LIMIT_PER_MINUTE는 0 이상의 정수여야 합니다")?,
         };
 
         config.validate()?;
@@ -51,6 +61,8 @@ impl Config {
             jwt_secret: "test-secret-test-secret-test-secret".to_string(),
             bind_addr: "127.0.0.1:0".to_string(),
             upload_dir: "uploads".to_string(),
+            cors_origin: DEFAULT_CORS_ORIGIN.to_string(),
+            rate_limit_per_minute: 0,
         }
     }
 
@@ -71,6 +83,13 @@ impl Config {
             tracing::warn!(
                 "기본 JWT_SECRET을 쓰고 있습니다. 운영 환경에서는 반드시 JWT_SECRET을 설정하세요."
             );
+        }
+
+        // 출처 문자열이 헤더 값으로 쓸 수 없으면 서버가 뜬 뒤가 아니라 지금 알려 준다.
+        for origin in self.cors_origin.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if origin.parse::<axum::http::HeaderValue>().is_err() {
+                anyhow::bail!("CORS_ORIGIN에 잘못된 값이 있습니다: {origin}");
+            }
         }
 
         Ok(())
