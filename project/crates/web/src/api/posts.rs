@@ -1,46 +1,63 @@
-//! 게시글 API.
+//! 게시글 API. **공통 API 스펙 v1 §1**
 
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::IntoResponse,
 };
 use domain::service::post as post_service;
-use domain::service::post::{PostPage, PostView};
 
 use crate::auth::AuthUser;
-use crate::dto::{CreatePostRequest, ListQuery, UpdatePostRequest};
+use crate::dto::{
+    CreatePostRequest, Data, ListQuery, Paged, PostResponse, UpdatePostRequest,
+};
 use crate::error::ApiResult;
 use crate::extract::{ValidatedJson, ValidatedQuery};
 use crate::state::AppState;
 
-/// GET /api/posts?page=1&per_page=10&q=검색어
+/// GET /api/posts?page=1&limit=10&q=검색어&sort=-createdAt
 pub async fn list(
     State(state): State<AppState>,
     ValidatedQuery(query): ValidatedQuery<ListQuery>,
-) -> ApiResult<Json<PostPage>> {
-    let page = post_service::list(&state.db, query.page, query.per_page, query.q.as_deref()).await?;
-    Ok(Json(page))
+) -> ApiResult<Json<Paged<PostResponse>>> {
+    let page = post_service::list(
+        &state.db,
+        query.page,
+        query.effective_limit(),
+        query.q.as_deref(),
+        query.sort(),
+    )
+    .await?;
+
+    Ok(Json(Paged::from_page(page, query.q)))
 }
 
 /// GET /api/posts/{id}
 pub async fn get_one(
     State(state): State<AppState>,
     Path(id): Path<i32>,
-) -> ApiResult<Json<PostView>> {
-    Ok(Json(post_service::find(&state.db, id).await?))
+) -> ApiResult<Json<Data<PostResponse>>> {
+    let view = post_service::find(&state.db, id).await?;
+    Ok(Json(Data::new(PostResponse::from(view))))
 }
 
-/// POST /api/posts — 로그인 필요
+/// POST /api/posts — 로그인 필요. 201 + `Location: /api/posts/{id}`
 pub async fn create(
     State(state): State<AppState>,
     user: AuthUser,
     ValidatedJson(body): ValidatedJson<CreatePostRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    let created = post_service::create(&state.db, user.id, &body.title, &body.body).await?;
-    tracing::info!(author = %user.username, post_id = created.id, "새 글 작성");
-    Ok((StatusCode::CREATED, Json(created)))
+    let created =
+        post_service::create(&state.db, user.id, &body.title, &body.body, &body.tags).await?;
+    tracing::info!(author = %user.nickname, post_id = created.id, "새 글 작성");
+
+    let location = format!("/api/posts/{}", created.id);
+    Ok((
+        StatusCode::CREATED,
+        [(header::LOCATION, location)],
+        Json(Data::new(PostResponse::from(created))),
+    ))
 }
 
 /// PATCH /api/posts/{id} — 로그인 필요 + 본인 글만
@@ -52,20 +69,21 @@ pub async fn update(
     user: AuthUser,
     Path(id): Path<i32>,
     ValidatedJson(body): ValidatedJson<UpdatePostRequest>,
-) -> ApiResult<Json<PostView>> {
+) -> ApiResult<Json<Data<PostResponse>>> {
     let updated = post_service::update(
         &state.db,
         id,
         user.id,
         body.title.as_deref(),
         body.body.as_deref(),
+        body.tags.as_deref(),
     )
     .await?;
 
-    Ok(Json(updated))
+    Ok(Json(Data::new(PostResponse::from(updated))))
 }
 
-/// DELETE /api/posts/{id} — 로그인 필요 + 본인 글만
+/// DELETE /api/posts/{id} — 로그인 필요 + 본인 글만. 204
 pub async fn delete(
     State(state): State<AppState>,
     user: AuthUser,

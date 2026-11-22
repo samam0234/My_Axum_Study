@@ -14,6 +14,11 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub body: String,
 
+    /// 태그 목록을 JSON 문자열(`["rust","axum"]`)로 저장한다. SQLite·PostgreSQL·MariaDB에서 같은 코드가 돌도록
+    /// 배열/JSON 컬럼 타입을 쓰지 않았다.
+    #[sea_orm(column_type = "Text")]
+    pub tags: String,
+
     /// 작성자 FK. demo/와 달리 **처음부터 NOT NULL**이다.
     /// 인증을 나중에 붙인 게 아니라 설계에 포함되어 있었기 때문.
     pub author_id: i32,

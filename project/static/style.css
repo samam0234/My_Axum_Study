@@ -162,3 +162,10 @@ label span { display: block; margin-bottom: 4px; }
 }
 
 form.auth { max-width: 360px; }
+
+/* 댓글 */
+.comments { list-style: none; padding: 0; margin: 0 0 16px; }
+.comment { border-top: 1px solid var(--border); padding: 10px 0; }
+.comment p { margin: 4px 0; white-space: pre-wrap; }
+.comment .danger { margin-left: 8px; padding: 2px 8px; font-size: 12px; }
+#comment-form textarea { width: 100%; min-height: 72px; margin-bottom: 8px; }

@@ -13,8 +13,9 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
 
+    /// 화면에 보이는 이름. 로그인은 이메일로 한다. (study6: 스펙 v1에서 username → nickname)
     #[sea_orm(unique)]
-    pub username: String,
+    pub nickname: String,
 
     #[sea_orm(unique)]
     pub email: String,

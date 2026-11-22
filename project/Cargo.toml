@@ -30,7 +30,7 @@ serde_json = "1.0.151"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal", "fs"] }
 tower = "0.5.3"
-tower-http = { version = "0.7.1", features = ["fs", "trace", "compression-gzip"] }
+tower-http = { version = "0.7.1", features = ["fs", "trace", "compression-gzip", "request-id", "catch-panic"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 validator = { version = "0.21.0", features = ["derive"] }

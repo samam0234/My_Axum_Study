@@ -38,10 +38,12 @@ docker compose down                 # 데이터 볼륨은 남는다 (-v를 붙�
 ## 테스트
 
 ```powershell
-cargo test --workspace      # 도메인 서비스 시험 5 (소유권·중복 가입·검색 대소문자·페이지네이션·로그인) + 유틸 1
+cargo test --workspace
+#   domain  서비스 8 (소유권·이메일/닉네임 충돌·검색 대소문자·페이지·정렬·댓글 cascade) + 유틸 1
+#   web     HTTP 표현 20 (스펙 v1 경로·응답·오류 모양, 쿠키 인증, 429) + 단위 6
 ```
 
-도메인 크레이트가 HTTP를 모르기 때문에 서버를 띄우지 않고 서비스 함수를 직접 시험합니다.
+도메인 크레이트가 HTTP를 모르기 때문에 서버를 띄우지 않고 서비스 함수를 직접 시험합니다. web 크레이트는 `tower::ServiceExt::oneshot`으로 라우터에 요청을 직접 넣습니다.
 
 ## 구조
 
@@ -52,35 +54,49 @@ project/
 ├─ crates/
 │  ├─ domain/              ← HTTP를 전혀 모르는 크레이트
 │  │  ├─ src/
-│  │  │  ├─ entity/        ← SeaORM 엔티티 (posts, users)
+│  │  │  ├─ entity/        ← SeaORM 엔티티 (posts, users, comments)
 │  │  │  ├─ migration/     ← Rust 코드로 쓴 마이그레이션 (DB 공통)
-│  │  │  ├─ service/       ← 비즈니스 규칙 (소유권 검사 포함)
+│  │  │  ├─ service/       ← 비즈니스 규칙 (소유권 검사 포함): user, post, comment
 │  │  │  ├─ error.rs       ← DomainError (StatusCode 없음!)
 │  │  │  └─ password.rs
 │  │  └─ tests/services.rs ← 서비스 시험
-│  └─ web/                 ← axum 바이너리
-│     └─ src/
-│        ├─ api/           ← 라우터 + 핸들러
-│        ├─ auth.rs        ← JWT + 쿠키 + AuthUser extractor
-│        ├─ dto.rs         ← 요청/응답 타입
-│        ├─ error.rs       ← DomainError → HTTP 번역 계층
-│        └─ main.rs
+│  └─ web/                 ← axum 라이브러리 + 바이너리
+│     ├─ src/
+│     │  ├─ api/           ← 라우터 + 핸들러 (users, posts, comments)
+│     │  ├─ auth.rs        ← JWT + 쿠키 + AuthUser extractor
+│     │  ├─ dto.rs         ← 요청/응답 타입 (camelCase, { data, meta })
+│     │  ├─ error.rs       ← DomainError → HTTP 번역 계층 (스펙 v1 오류 본문)
+│     │  ├─ middleware.rs  ← 요청 ID, 오류 본문 마무리(requestId), 패닉 처리
+│     │  ├─ ratelimit.rs   ← 429 RATE_LIMITED
+│     │  ├─ lib.rs         ← app() — main과 테스트가 공유
+│     │  └─ main.rs
+│     └─ tests/api.rs      ← HTTP 표현 시험
 └─ static/                 ← vanilla JS SPA (index.html / app.js / style.css)
 ```
 
-## API
+## API — 공통 API 스펙 v1
 
-| 메서드 | 경로 | 인증 |
-|---|---|---|
-| GET | `/api/health` | — |
-| POST | `/api/auth/register` | — |
-| POST | `/api/auth/login` | — (성공 시 세션 쿠키 발급) |
-| POST | `/api/auth/logout` | — |
-| GET | `/api/auth/me` | 🔒 |
-| GET | `/api/posts?page=&per_page=&q=` | — |
-| GET | `/api/posts/{id}` | — |
-| POST | `/api/posts` | 🔒 |
-| PATCH | `/api/posts/{id}` | 🔒 본인 글만 |
-| DELETE | `/api/posts/{id}` | 🔒 본인 글만 |
+[공통 API 스펙 v1](https://app.notion.com/p/3d6d7dec5e2e8139adbfd36dd506c65e)의 §1 표와 줄 단위로 대응합니다.
 
-> 이 API의 응답·오류 모양은 **공통 API 스펙 v1과 아직 다릅니다**(목록 `items`/`per_page` snake_case, 오류 `{ error: "code", message }`). 스펙에 맞춘 쪽은 `demo/`의 오류 본문이고, 차이 표와 이 프로젝트를 스펙에 맞추는 순서는 [../study6.md](../study6.md) ④와 [../studyFinal.md](../studyFinal.md)에 있습니다.
+| 메서드 | 경로 | 인증 | 성공 |
+|---|---|---|---|
+| GET | `/health` | — | 200 `{ "status": "ok" }` (접두어 없이) |
+| POST | `/api/auth/signup` | — | 201 `{ data: { id, email, nickname, createdAt } }` |
+| POST | `/api/auth/login` | — | 200 `{ data: { user, accessToken } }` (+ 세션 쿠키) |
+| POST | `/api/auth/logout` | 🔒 | 204 (쿠키 삭제) |
+| GET | `/api/auth/me` | 🔒 | 200 `{ data: user }` |
+| GET | `/api/posts?q=&page=&limit=&sort=` | — | 200 `{ data: [...], meta: { page, limit, total, totalPages, q } }` |
+| GET | `/api/posts/{id}` | — | 200 `{ data: post }` |
+| POST | `/api/posts` | 🔒 | 201 + `Location: /api/posts/{id}` |
+| PATCH | `/api/posts/{id}` | 🔒 본인 글만 | 200 |
+| DELETE | `/api/posts/{id}` | 🔒 본인 글만 | 204 |
+| GET | `/api/posts/{id}/comments` | — | 200 `{ data: [...] }` |
+| POST | `/api/posts/{id}/comments` | 🔒 | 201 |
+| DELETE | `/api/comments/{id}` | 🔒 작성자만 | 204 |
+
+- 글: `{ id, title, body, tags, author: { id, nickname }, commentCount, createdAt, updatedAt }`
+- `limit` 기본 10, **50을 넘기면 50으로 줄인다.** `sort`는 `createdAt` · `-createdAt`(기본) · `-commentCount`
+- 오류: `{ error: { code, message, fields, requestId } }` — `VALIDATION_ERROR`·`BAD_REQUEST`(400), `UNAUTHORIZED`·`INVALID_CREDENTIALS`(401), `FORBIDDEN`(403), `NOT_FOUND`(404), `EMAIL_TAKEN`·`CONFLICT`(409), `RATE_LIMITED`(429), `INTERNAL`(500). `requestId`는 응답 헤더 `X-Request-Id`와 같은 값
+- 인증: `Authorization: Bearer <accessToken>` 또는 같은 도메인의 HttpOnly 쿠키 `session` (스펙 §6). 응답 본문 형식은 둘 다 같다
+- 호출 제한: IP당 분당 `RATE_LIMIT_PER_MINUTE`(기본 300)회. 초과하면 429 + `Retry-After`
+- 옛 DB(닉네임 대신 `username`을 쓰던 시절)는 시작할 때 마이그레이션 `m0002_spec_v1`이 컬럼 이름을 바꾸고 `tags`·`comments`를 추가합니다. 데이터는 그대로 남습니다.

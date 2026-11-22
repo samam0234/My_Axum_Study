@@ -5,8 +5,8 @@
 use axum::{
     Json,
     extract::{FromRequest, FromRequestParts, Request, rejection::JsonRejection},
-    http::request::Parts,
-    response::{IntoResponse, Response},
+    http::{StatusCode, request::Parts},
+    response::Response,
 };
 use serde::de::DeserializeOwned;
 use validator::Validate;
@@ -58,14 +58,16 @@ where
     }
 }
 
+/// 본문 파싱 실패를 스펙의 오류 코드로 옮긴다.
+///
+/// axum은 "JSON 문법은 맞는데 타입이 틀림"을 422로 주지만 스펙은 400이다. (`BAD_REQUEST`)
 fn json_rejection_to_response(rejection: JsonRejection) -> Response {
-    let status = rejection.status();
-    (
-        status,
-        Json(serde_json::json!({
-            "error": "invalid_body",
-            "message": rejection.body_text(),
-        })),
-    )
-        .into_response()
+    let (status, code) = match rejection.status() {
+        StatusCode::PAYLOAD_TOO_LARGE => (StatusCode::PAYLOAD_TOO_LARGE, "PAYLOAD_TOO_LARGE"),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+            (StatusCode::UNSUPPORTED_MEDIA_TYPE, "UNSUPPORTED_MEDIA_TYPE")
+        }
+        _ => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
+    };
+    error::respond(status, code, rejection.body_text())
 }

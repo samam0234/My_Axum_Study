@@ -44,6 +44,6 @@ ENV DATABASE_URL="sqlite:///app/data/board.db?mode=rwc" \
 
 EXPOSE 4000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:4000/api/health || exit 1
+    CMD curl -fsS http://127.0.0.1:4000/health || exit 1
 
 CMD ["web"]

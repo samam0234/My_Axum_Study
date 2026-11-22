@@ -20,16 +20,16 @@ pub const TOKEN_TTL_SECONDS: i64 = 60 * 60 * 12;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: i32,
-    pub username: String,
+    pub nickname: String,
     pub iat: i64,
     pub exp: i64,
 }
 
-pub fn encode_token(secret: &str, user_id: i32, username: &str) -> anyhow::Result<String> {
+pub fn encode_token(secret: &str, user_id: i32, nickname: &str) -> anyhow::Result<String> {
     let now = chrono::Utc::now().timestamp();
     let claims = Claims {
         sub: user_id,
-        username: username.to_string(),
+        nickname: nickname.to_string(),
         iat: now,
         exp: now + TOKEN_TTL_SECONDS,
     };
@@ -73,7 +73,7 @@ pub fn clear_cookie() -> String {
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub id: i32,
-    pub username: String,
+    pub nickname: String,
 }
 
 impl FromRequestParts<AppState> for AuthUser {
@@ -100,7 +100,7 @@ impl FromRequestParts<AppState> for AuthUser {
 
         Ok(AuthUser {
             id: claims.sub,
-            username: claims.username,
+            nickname: claims.nickname,
         })
     }
 }

@@ -18,7 +18,10 @@ pub enum DomainError {
     #[error("{0}")]
     Conflict(String),
 
-    #[error("아이디 또는 비밀번호가 올바르지 않습니다")]
+    #[error("이미 사용 중인 이메일입니다")]
+    EmailTaken,
+
+    #[error("이메일 또는 비밀번호가 올바르지 않습니다")]
     InvalidCredentials,
 
     #[error("{0}")]

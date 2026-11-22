@@ -38,13 +38,16 @@ async function api(path, { method = "GET", body } = {}) {
 
   const data = await res.json().catch(() => null);
   if (!res.ok) {
-    const err = new Error(data?.message ?? `요청 실패 (${res.status})`);
+    // 공통 API 스펙 v1 §5: { error: { code, message, fields, requestId } }
+    const e = data?.error;
+    const err = new Error(e?.message ?? `요청 실패 (${res.status})`);
     err.status = res.status;
-    err.code = data?.error;
-    err.details = data?.details;
+    err.code = e?.code;
+    err.details = e?.fields;
+    err.requestId = e?.requestId;
     throw err;
   }
-  return data;
+  return data; // 성공은 { data } 또는 { data, meta }
 }
 
 function renderFieldErrors(details) {
@@ -58,7 +61,7 @@ function renderFieldErrors(details) {
 // ── 상단 내비게이션 ──────────────────────────────────────────────────────
 function renderNav() {
   nav.innerHTML = me
-    ? `<span class="who">${esc(me.username)} 님</span>
+    ? `<span class="who">${esc(me.nickname)} 님</span>
        <a class="btn" href="#/new">글쓰기</a>
        <button id="logout">로그아웃</button>`
     : `<a class="btn" href="#/login">로그인</a>
@@ -67,7 +70,8 @@ function renderNav() {
   const logout = document.getElementById("logout");
   if (logout) {
     logout.onclick = async () => {
-      await api("/auth/logout", { method: "POST" });
+      // 세션이 이미 만료돼 401이어도 화면은 로그아웃 상태로 만든다.
+      await api("/auth/logout", { method: "POST" }).catch(() => {});
       me = null;
       renderNav();
       toast("로그아웃했습니다.");
@@ -84,24 +88,25 @@ async function viewList(params) {
 
   app.innerHTML = `<p class="muted">불러오는 중…</p>`;
 
-  const search = new URLSearchParams({ page: String(page), per_page: "5" });
+  const search = new URLSearchParams({ page: String(page), limit: "5" });
   if (q) search.set("q", q);
 
-  let data;
+  let res;
   try {
-    data = await api(`/posts?${search}`);
+    res = await api(`/posts?${search}`);
   } catch (e) {
     app.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
     return;
   }
+  const { data: posts, meta } = res;
 
-  const items = data.items
+  const items = posts
     .map(
       (p) => `
       <article class="card">
         <a href="#/posts/${p.id}">
           <h3>${esc(p.title)}</h3>
-          <p class="meta">${esc(p.author_name)} · ${esc(fmtDate(p.created_at))}</p>
+          <p class="meta">${esc(p.author.nickname)} · ${esc(fmtDate(p.createdAt))} · 댓글 ${p.commentCount}</p>
           <p class="excerpt">${esc(p.body.slice(0, 110))}${p.body.length > 110 ? "…" : ""}</p>
         </a>
       </article>`,
@@ -110,7 +115,7 @@ async function viewList(params) {
 
   app.innerHTML = `
     <h1>게시판</h1>
-    <p class="muted">전체 ${data.total}건 · ${data.page}/${Math.max(data.total_pages, 1)} 페이지</p>
+    <p class="muted">전체 ${meta.total}건 · ${meta.page}/${Math.max(meta.totalPages, 1)} 페이지</p>
 
     <form class="toolbar" id="search-form">
       <input type="search" name="q" value="${esc(q)}" placeholder="제목 또는 본문 검색" />
@@ -122,8 +127,8 @@ async function viewList(params) {
 
     <div class="pager">
       <button ${page <= 1 ? "disabled" : ""} id="prev">이전</button>
-      <span class="muted">${data.page} / ${Math.max(data.total_pages, 1)}</span>
-      <button ${page >= data.total_pages ? "disabled" : ""} id="next">다음</button>
+      <span class="muted">${meta.page} / ${Math.max(meta.totalPages, 1)}</span>
+      <button ${page >= meta.totalPages ? "disabled" : ""} id="next">다음</button>
     </div>
   `;
 
@@ -147,21 +152,37 @@ async function viewPost(id) {
   app.innerHTML = `<p class="muted">불러오는 중…</p>`;
 
   let post;
+  let comments;
   try {
-    post = await api(`/posts/${id}`);
+    post = (await api(`/posts/${id}`)).data;
+    comments = (await api(`/posts/${id}/comments`)).data;
   } catch (e) {
     app.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
     return;
   }
 
-  const mine = me && me.id === post.author_id;
+  const mine = me && me.id === post.author.id;
+  const commentItems = comments
+    .map(
+      (c) => `
+      <li class="comment">
+        <p class="meta">${esc(c.author.nickname)} · ${esc(fmtDate(c.createdAt))}${
+          me && me.id === c.author.id
+            ? ` <button class="danger" data-delete-comment="${c.id}">삭제</button>`
+            : ""
+        }</p>
+        <p>${esc(c.body)}</p>
+      </li>`,
+    )
+    .join("");
 
   app.innerHTML = `
     <p class="muted"><a href="#/">← 목록</a></p>
     <h1>${esc(post.title)}</h1>
-    <p class="muted">${esc(post.author_name)} · ${esc(fmtDate(post.created_at))}${
-      post.updated_at !== post.created_at ? ` (수정됨 ${esc(fmtDate(post.updated_at))})` : ""
+    <p class="muted">${esc(post.author.nickname)} · ${esc(fmtDate(post.createdAt))}${
+      post.updatedAt !== post.createdAt ? ` (수정됨 ${esc(fmtDate(post.updatedAt))})` : ""
     }</p>
+    ${post.tags.length ? `<p class="muted">${post.tags.map((t) => `#${esc(t)}`).join(" ")}</p>` : ""}
     <div class="post-body">${esc(post.body)}</div>
     ${
       mine
@@ -171,7 +192,45 @@ async function viewPost(id) {
            </div>`
         : ""
     }
+
+    <h2>댓글 ${comments.length}</h2>
+    <ul class="comments">${commentItems || `<li class="muted">아직 댓글이 없습니다.</li>`}</ul>
+    ${
+      me
+        ? `<form id="comment-form">
+             <textarea name="body" maxlength="1000" required placeholder="댓글을 입력하세요"></textarea>
+             <div id="comment-errors"></div>
+             <button class="primary" type="submit">댓글 등록</button>
+           </form>`
+        : `<p class="muted"><a href="#/login">로그인</a>하면 댓글을 쓸 수 있습니다.</p>`
+    }
   `;
+
+  const commentForm = document.getElementById("comment-form");
+  if (commentForm) {
+    commentForm.onsubmit = async (e) => {
+      e.preventDefault();
+      const body = new FormData(commentForm).get("body").trim();
+      try {
+        await api(`/posts/${post.id}/comments`, { method: "POST", body: { body } });
+        viewPost(id); // 목록과 댓글 수를 다시 읽는다
+      } catch (err) {
+        document.getElementById("comment-errors").innerHTML =
+          renderFieldErrors(err.details) || `<p class="field-errors">${esc(err.message)}</p>`;
+      }
+    };
+  }
+
+  document.querySelectorAll("[data-delete-comment]").forEach((button) => {
+    button.onclick = async () => {
+      try {
+        await api(`/comments/${button.dataset.deleteComment}`, { method: "DELETE" });
+        viewPost(id);
+      } catch (err) {
+        toast(err.message);
+      }
+    };
+  });
 
   const del = document.getElementById("delete");
   if (del) {
@@ -200,6 +259,9 @@ function viewEditor(post) {
       <label><span>본문</span>
         <textarea name="body" maxlength="5000" required>${esc(post?.body ?? "")}</textarea>
       </label>
+      <label><span>태그 (쉼표로 구분, 최대 5개)</span>
+        <input name="tags" value="${esc((post?.tags ?? []).join(", "))}" />
+      </label>
       <div id="errors"></div>
       <div class="toolbar">
         <button class="primary" type="submit">${editing ? "저장" : "등록"}</button>
@@ -211,12 +273,19 @@ function viewEditor(post) {
   document.getElementById("post-form").onsubmit = async (e) => {
     e.preventDefault();
     const form = new FormData(e.target);
-    const payload = { title: form.get("title").trim(), body: form.get("body") };
+    const tags = form
+      .get("tags")
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+    const payload = { title: form.get("title").trim(), body: form.get("body"), tags };
 
     try {
-      const saved = editing
-        ? await api(`/posts/${post.id}`, { method: "PATCH", body: payload })
-        : await api("/posts", { method: "POST", body: payload });
+      const saved = (
+        editing
+          ? await api(`/posts/${post.id}`, { method: "PATCH", body: payload })
+          : await api("/posts", { method: "POST", body: payload })
+      ).data;
 
       toast(editing ? "수정했습니다." : "등록했습니다.");
       location.hash = `#/posts/${saved.id}`;
@@ -233,8 +302,8 @@ function viewAuth(mode) {
   app.innerHTML = `
     <h1>${isLogin ? "로그인" : "회원가입"}</h1>
     <form class="auth" id="auth-form">
-      <label><span>아이디</span><input name="username" required /></label>
-      ${isLogin ? "" : `<label><span>이메일</span><input name="email" type="email" required /></label>`}
+      <label><span>이메일</span><input name="email" type="email" required /></label>
+      ${isLogin ? "" : `<label><span>닉네임</span><input name="nickname" minlength="2" maxlength="20" required /></label>`}
       <label><span>비밀번호</span><input name="password" type="password" required /></label>
       <div id="errors"></div>
       <div class="toolbar">
@@ -253,12 +322,13 @@ function viewAuth(mode) {
 
     try {
       if (isLogin) {
-        me = await api("/auth/login", { method: "POST", body: payload });
+        // 응답: { data: { user, accessToken } }. 토큰은 쿠키로도 와서 JS가 따로 저장할 필요가 없다.
+        me = (await api("/auth/login", { method: "POST", body: payload })).data.user;
         renderNav();
-        toast(`${me.username} 님, 환영합니다.`);
+        toast(`${me.nickname} 님, 환영합니다.`);
         location.hash = "#/";
       } else {
-        await api("/auth/register", { method: "POST", body: payload });
+        await api("/auth/signup", { method: "POST", body: payload });
         toast("가입했습니다. 로그인해 주세요.");
         location.hash = "#/login";
       }
@@ -293,8 +363,8 @@ async function route() {
 
   if (editMatch) {
     try {
-      const post = await api(`/posts/${editMatch[1]}`);
-      if (!me || me.id !== post.author_id) {
+      const post = (await api(`/posts/${editMatch[1]}`)).data;
+      if (!me || me.id !== post.author.id) {
         toast("본인이 작성한 글만 수정할 수 있습니다.");
         location.hash = `#/posts/${post.id}`;
         return;
@@ -315,7 +385,7 @@ window.addEventListener("hashchange", route);
 
 (async function start() {
   try {
-    me = await api("/auth/me"); // 쿠키가 있으면 로그인 상태 복원
+    me = (await api("/auth/me")).data; // 쿠키가 있으면 로그인 상태 복원
   } catch {
     me = null;
   }
