@@ -1,0 +1,74 @@
+# 릴리스 이미지 빌드·게시 — `v*` 태그를 푸시하거나 수동 실행할 때만 돈다. (study16, studyFinal)
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# 결과:  ghcr.io/<소유자>/<저장소>/demo:0.1.0     (게시판 API, demo/)
+#        ghcr.io/<소유자>/<저장소>/project:0.1.0  (최종 서비스, project/ — 웹사이트 + API)
+# 별도 비밀키가 필요 없다. 워크플로가 자동으로 받는 GITHUB_TOKEN으로 GHCR에 올린다.
+name: docker-publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write # GHCR에 이미지를 올리려면 필요
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # 한 이미지가 실패해도 다른 이미지는 계속 만든다
+      matrix:
+        include:
+          - name: demo
+            context: demo
+          - name: project
+            context: project
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 태그에서 이미지 태그를 만든다: v0.1.0 → 0.1.0, latest
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/${{ matrix.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # 레이어 캐시를 Actions 캐시에 저장한다. Dockerfile의 "의존성 레이어 캐싱 트릭"과 함께 쓰면
+          # 소스만 바뀐 빌드가 수 분에서 수십 초로 줄어든다. (이미지별로 캐시 범위를 나눈다)
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  # 서버에 자동 배포까지 하려면 아래 job을 켠다. (필요한 시크릿: DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY)
+  # deploy:
+  #   needs: publish
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: appleboy/ssh-action@v1
+  #       with:
+  #         host: ${{ secrets.DEPLOY_HOST }}
+  #         username: ${{ secrets.DEPLOY_USER }}
+  #         key: ${{ secrets.DEPLOY_SSH_KEY }}
+  #         script: |
+  #           cd /srv/rust-board
+  #           docker compose pull
+  #           docker compose up -d
+  #           curl -fsS http://127.0.0.1:4000/api/health   # 배포 직후 헬스체크. 실패하면 job이 실패한다

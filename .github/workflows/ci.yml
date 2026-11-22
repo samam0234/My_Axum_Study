@@ -1,0 +1,65 @@
+# CI — push / PR마다 테스트를 돌린다. (study16)
+#
+# 이 저장소는 Cargo 프로젝트가 세 개(demo, project, lab)라서 job을 나눈다.
+# 서로 의존하지 않으므로 병렬로 돌고, 하나가 깨져도 나머지 결과를 볼 수 있다.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# 같은 브랜치에서 새 푸시가 오면 이전 실행은 취소한다. (러너 시간 절약)
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  demo:
+    name: demo (sqlite 테스트 + postgres 빌드)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: demo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # target/ 폴더와 ~/.cargo 레지스트리를 캐시한다. Rust CI에서 가장 효과가 큰 한 줄이다.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: demo
+      - name: 테스트 (in-memory SQLite)
+        run: cargo test
+      - name: PostgreSQL feature로도 컴파일되는가
+        run: cargo check --no-default-features --features postgres
+
+  project:
+    name: project (워크스페이스 테스트)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: project
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: project
+      - run: cargo test --workspace
+
+  lab:
+    name: lab (예제 컴파일 + 테스트)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lab
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lab
+      - run: cargo test --lib --examples
