@@ -225,7 +225,7 @@ GET /nope → 404 (0.0ms)
 | **개발 서버 프록시** | Vite `server.proxy: { "/api": "http://127.0.0.1:3000" }` | 브라우저는 같은 출처로 보인다. CORS 설정 불필요 |
 | **CORS 허용** | 프론트 `:5173` → API `:3000` 직접 호출 + `CorsLayer` | 설정 필요, 쿠키를 쓰면 `credentials` + 정확한 Origin (study12) |
 
-경로 합의는 문서 한 장으로 한다 — **공통 API 스펙 v1**(Base URL `/api`, `/api/posts`, `/api/posts/{id}`, `/api/auth/login` …). 이 저장소의 `demo/`는 현재 `/api` 접두어 없이 `/posts`, `/auth/*`를 쓰고 있다 (study6의 확인 결과 참고).
+경로 합의는 문서 한 장으로 한다 — **공통 API 스펙 v1**(Base URL `/api`, `/api/posts`, `/api/posts/{id}`, `/api/auth/login` …). 이 저장소의 `demo/`와 `project/`는 이 경로를 그대로 쓴다 (study6 ④의 대조표). 이 단계의 `lab/` 예제(`s04_routing`)는 라우팅 연습용이라 `/api` 접두어 없이 단순한 경로를 쓴다.
 
 ### CORS는 서버가 아니라 **브라우저**가 막는다
 

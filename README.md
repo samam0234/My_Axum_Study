@@ -18,7 +18,7 @@ Rust 웹 프레임워크 [Axum](https://github.com/tokio-rs/axum) **하나만** 
 | [study3.md](study3.md) | **데이터 다루기** — `Arc<RwLock<…>>`, 파일 저장(임시 파일 + rename), 화면 바인딩, `localStorage` | [s03_store.rs](lab/examples/s03_store.rs) |
 | [study4.md](study4.md) | **라우팅과 요청 처리** — 동적/와일드카드 경로, 쿼리, 404/405, 미들웨어 흐름, CORS | [s04_routing.rs](lab/examples/s04_routing.rs) |
 | [study5.md](study5.md) | **폼·입력·검증** — `validator`, `ValidatedJson`, 상태 코드별 화면, 중복 제출 방지 | [s05_form.rs](lab/examples/s05_form.rs) |
-| [study6.md](study6.md) | **DB·API 연동** — sqlx CRUD, 마이그레이션, 스펙 v1 오류 본문·camelCase, 환경변수 | [demo/](demo/) |
+| [study6.md](study6.md) | **DB·API 연동** — sqlx CRUD, 마이그레이션, **공통 API 스펙 v1**(`/api`, `{ data, meta }`, 오류 본문, 댓글, 429), 환경변수 | [demo/](demo/) |
 | [study7.md](study7.md) | **인증·보안 기초** — Argon2, JWT, `AuthUser`, 401/403, CORS·XSS·CSRF, Bearer vs 쿠키 | [demo/src/auth/](demo/src/auth/) |
 | [study8.md](study8.md) | **구조화·재사용** — lib+bin, 공통 모듈, `Config`, 미들웨어 순서, 개발/운영 설정 | [demo/src/lib.rs](demo/src/lib.rs) |
 | [study9.md](study9.md) | **테스트·디버깅** — 단위·`oneshot` 테스트, 로그, 오류 TOP 10, mock | [demo/tests/](demo/tests/), [lab/src/mock_demo.rs](lab/src/mock_demo.rs) |
@@ -28,7 +28,7 @@ Rust 웹 프레임워크 [Axum](https://github.com/tokio-rs/axum) **하나만** 
 
 | 문서 | 주제 |
 |---|---|
-| [studyMidpoint.md](studyMidpoint.md) | study0~10만으로 **게시판 · 로그인 · CRUD 서비스**를 조립: 기능 목록, 폴더 구조, 구현 순서 16단계, 연동 구성도, 1차 배포 체크리스트, 회고 |
+| [studyMidpoint.md](studyMidpoint.md) | study0~10만으로 **게시판 · 로그인 · CRUD 서비스**를 조립: 기능 목록, 폴더 구조, 구현 순서 17단계, 연동 구성도, 1차 배포 체크리스트, 회고 |
 
 ### 심화 구간 (study11 ~ study18)
 
@@ -105,7 +105,8 @@ copy .env.example .env      # 선택: 값을 바꾸고 싶을 때
 cargo run                   # http://127.0.0.1:3000
 ```
 
-- API 문서(Swagger UI): `http://127.0.0.1:3000/docs`, OpenAPI JSON: `/api-docs/openapi.json`
+- API 문서(Swagger UI): `http://127.0.0.1:3000/api-docs/`, OpenAPI JSON: `/api-docs/openapi.json` (공통 API 스펙 v1 §7)
+- 환경변수: `DATABASE_URL`, `JWT_SECRET`, `BIND_ADDR`, `UPLOAD_DIR`, `CORS_ORIGIN`(쉼표로 여러 개), `RATE_LIMIT_PER_MINUTE`, `RUST_LOG` — [demo/.env.example](demo/.env.example)
 - PostgreSQL로 실행: [study11.md](study11.md) — `docker compose -f compose.postgres.yaml up -d` 후 `cargo run --no-default-features --features postgres`
 - Docker로 실행: [study10.md](study10.md) — `docker build -t axum-demo . ; docker run -e JWT_SECRET=... -p 3000:3000 axum-demo`
 
@@ -138,8 +139,8 @@ cargo run --example s18_ai             # study18, 포트 3018 (가짜 AI 서버 
 ## 테스트
 
 ```powershell
-cd demo    ; cargo test                       # 단위 7 + 통합 15
-cd project ; cargo test --workspace           # 도메인 서비스 5 + 유틸 1
+cd demo    ; cargo test                       # 단위 12 + 통합 31
+cd project ; cargo test --workspace           # domain 서비스 8 + 유틸 1, web 단위 6 + HTTP 20
 cd lab     ; cargo test --lib --examples      # mock 3 + 웹훅 서명 3 + 프롬프트/스트림 3
 cd lab     ; node --test static/api.test.mjs  # 프론트 API 클라이언트 9
 ```

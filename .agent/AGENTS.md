@@ -26,8 +26,8 @@
 
 ### 코드 폴더
 
-- `demo/`: 게시판 API (sqlx · 단일 크레이트 · lib+bin). study6~10과 midpoint의 결과물. SQLite 기본, `--no-default-features --features postgres`로 PostgreSQL.
-- `project/`: 최종 서비스 (Cargo 워크스페이스 `domain`/`web` + SeaORM + 쿠키 세션 + SPA). studyFinal의 결과물. DB 종류는 `DATABASE_URL`의 스킴.
+- `demo/`: 게시판 API (sqlx · 단일 크레이트 · lib+bin). study6~10과 midpoint의 결과물. **공통 API 스펙 v1을 따른다** (`/api`, `{ data, meta }`, 오류 본문, 댓글, 429, `CORS_ORIGIN`). SQLite 기본, `--no-default-features --features postgres`로 PostgreSQL.
+- `project/`: 최종 서비스 (Cargo 워크스페이스 `domain`/`web` + SeaORM + 쿠키 세션 + SPA). studyFinal의 결과물. demo와 **같은 스펙 v1 API**를 낸다 (`web`은 lib + bin, HTTP 시험 포함). DB 종류는 `DATABASE_URL`의 스킴.
 - `lab/`: 단계별 미니 예제 (`examples/s01~s18_*.rs`, `src/mock_demo.rs`, `static/api.js`). 문서의 코드는 여기서 컴파일·실행으로 검증합니다.
 - `.github/workflows/`: `ci.yml`(테스트), `docker-publish.yml`(태그 시 이미지 게시).
 - 옛 커밋 메시지의 `studyN`은 커리큘럼 재편 이전 번호입니다. 대응표는 [README.md](../README.md)에 있습니다.

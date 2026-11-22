@@ -71,7 +71,7 @@
 
 ```rust
 #[utoipa::path(
-    patch, path = "/posts/{id}", tag = "posts",
+    patch, path = "/api/posts/{id}", tag = "posts",
     params(("id" = i64, Path, description = "게시글 id")),
     request_body = UpdatePost,
     security(("bearer_auth" = [])),                        // 🔒 인증 필요 표시
@@ -97,25 +97,29 @@ pub struct ApiDoc;
 ```
 
 ```rust
-.merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
+.merge(SwaggerUi::new("/api-docs").url("/api-docs/openapi.json", ApiDoc::openapi()))     // 스펙 §7: 문서는 /api-docs
 ```
 
 실제 생성된 결과 (`GET /api-docs/openapi.json`):
 
 ```
-paths:      /auth/login [post]   /auth/me [get]   /auth/register [post]
-            /posts [get, post]   /posts/{id} [get, delete, patch]   /posts/{id}/thumbnail [post]
-schemas:    CreatePost, LoginRequest, Page_Post, Post, RegisterRequest, TokenResponse, UpdatePost, UserPublic
+paths:      /api/auth/login [post]   /api/auth/logout [post]   /api/auth/me [get]   /api/auth/signup [post]
+            /api/comments/{id} [delete]
+            /api/posts [get, post]   /api/posts/{id} [delete, get, patch]   /api/posts/{id}/comments [get, post]
+            /api/posts/{id}/thumbnail [post]
+schemas:    Author, Comment, CreateComment, CreatePost, Data_Comment, Data_LoginData, Data_Post, Data_UserPublic,
+            Data_Vec_Comment, LoginData, LoginRequest, PageMeta, Paged_Post, Post, SignupRequest, UpdatePost, UserPublic
 security:   bearer_auth → { type: http, scheme: bearer, bearerFormat: JWT }
-Post.properties:  authorId, createdAt, id, tags, thumbnail, ...      ← camelCase가 문서에도 반영됨
-GET /docs/  → 200 (Swagger UI)
+Post.properties:  author, body, commentCount, createdAt, id, tags, thumbnail, title, updatedAt      ← camelCase가 문서에도 반영됨
+Paged_Post:       data, meta                                                                         ← { data, meta } 껍데기도 제네릭 스키마로 나온다
+GET /api-docs/  → 200 (Swagger UI)
 ```
 
 `#[serde(rename_all = "camelCase")]`를 **한 번** 적으면 응답 JSON과 OpenAPI 스키마가 **함께** 바뀐다. 문서와 구현이 같은 타입에서 나오므로 어긋나지 않는다.
 
-> ⚠️ 문서가 구현과 어긋나는 곳: 핸들러에 적은 `responses(...)`는 **손으로 쓴 약속**이다. 상태 코드를 코드에서 바꾸고 어트리뷰트를 안 고치면 문서가 거짓말이 된다. 공통 오류 본문 스키마(`ErrorEnvelope`)도 아직 `components`에 등록하지 않았다 (직접 해보기 3). 스펙 v1은 문서 경로를 `/api-docs`로 정했는데 현재는 `/docs`(UI) + `/api-docs/openapi.json`이다.
+> ⚠️ 문서가 구현과 어긋나는 곳: 핸들러에 적은 `responses(...)`는 **손으로 쓴 약속**이다. 상태 코드를 코드에서 바꾸고 어트리뷰트를 안 고치면 문서가 거짓말이 된다. 공통 오류 본문 스키마(`ErrorEnvelope`)도 아직 `components`에 등록하지 않았다 (직접 해보기 3). 문서 경로는 스펙 §7대로 `/api-docs`(UI)와 `/api-docs/openapi.json`이다.
 
-**문서의 쓸모**: ① 프론트가 `openapi.json`에서 **타입을 생성**해 서버와 어긋나지 않는다 ② Swagger UI(`/docs`)에서 "Authorize"로 토큰을 넣고 바로 호출해 본다 ③ 리뷰·변경 시 계약 차이를 diff로 본다.
+**문서의 쓸모**: ① 프론트가 `openapi.json`에서 **타입을 생성**해 서버와 어긋나지 않는다 ② Swagger UI(`/api-docs/`)에서 "Authorize"로 토큰을 넣고 바로 호출해 본다 ③ 리뷰·변경 시 계약 차이를 diff로 본다.
 
 ### 3-2. 설계 실험 서버 — [lab/examples/s14_api_design.rs](lab/examples/s14_api_design.rs)
 
@@ -245,7 +249,7 @@ $ curl -H 'If-None-Match: "6c92edf1256d65b2"' .../posts/5  → 304 (본문 없�
 |---|---|
 | **프론트 타입 생성** | `GET /api-docs/openapi.json` → TypeScript 타입 생성 도구(예: `openapi-typescript`) → 프론트가 서버 DTO와 같은 타입. camelCase가 자동 일치 |
 | **프론트 서버 상태 캐시** | 경로+쿼리가 캐시 키. `page`/`limit`/`q`/`sort` 이름을 지키면 프론트 코드가 그대로 (study12) |
-| **스펙 v1 차이 해소** | [study6 ④](study6.md)의 ❌ 목록 → 이 단계의 규칙으로 하나씩: `/api` 접두어, `{ data, meta }`, `limit`(최대 50), `sort`, 글 `body`, 댓글 |
+| **스펙 v1 정렬 (완료)** | [study6 ④](study6.md)의 ❌ 목록을 이 단계의 규칙으로 하나씩 지웠다: `/api` 접두어, `{ data, meta }`, `limit`(최대 50), `sort`, 글 `body`, 댓글. 이제는 계약을 **시험으로 지키는 일**이 남는다(`demo`·`project`의 HTTP 시험) |
 | **오류 계약 → 화면 분기** | `error.code` 표가 곧 프론트의 `switch` 문. `api.js`의 `ApiError.code` (study12) |
 | **버전 → 배포** | v1/v2를 한 서버에서 동시에 서빙하다가 `Sunset` 날짜에 v1 제거. 배포 점검표(study10)에 "옛 버전 호출 로그"를 추가 |
 | **ETag → CDN/브라우저 캐시** | `ETag`/`304`, `Cache-Control`을 붙이면 중간 캐시가 활용된다 (study15) |
@@ -275,7 +279,7 @@ $ curl -H 'If-None-Match: "6c92edf1256d65b2"' .../posts/5  → 304 (본문 없�
 
 ## ⑥ 직접 해보기
 
-1. **스펙 v1 차이 하나 해소**: `demo/`의 `GET /posts` 응답을 `{ data, meta }`로 감싸고 `per_page`를 `limit`(최대 50)으로 바꾼다. 테스트를 먼저 고쳐서 실패시킨 뒤 구현한다. 프론트(`api.js`)가 코드 변경 없이 `res.data`/`res.meta`를 읽는지 확인한다.
+1. **스펙 v1을 눈으로 대조**: Swagger UI(`/api-docs/`)에서 `GET /api/posts`를 "Try it out"으로 호출해 응답이 `{ data, meta }`인지, `limit=999`가 50으로 보정되는지 확인한다. 프론트(`api.js`)가 코드 변경 없이 `res.data`/`res.meta`를 읽는지도 본다. 그다음 스펙 §1의 표에서 **하나를 골라 일부러 어긋나게** 고치고(예: 삭제를 200으로) 어떤 테스트가 깨지는지 본다. 계약을 지키는 것은 문서가 아니라 테스트다.
 2. **불투명 커서**: `nextCursor`를 id 숫자 그대로 주지 말고 `base64(json)`으로 인코딩해 내부 구조를 숨긴다. 잘못된 커서는 400 `BAD_REQUEST`로 처리한다.
 3. **오류 스키마를 OpenAPI에 등록**: `ErrorEnvelope`에 `ToSchema`를 달고 `components(schemas(...))`에 넣은 뒤, 각 핸들러의 `responses(...)`에서 `body = ErrorEnvelope`로 참조한다. Swagger UI에서 오류 모양이 보이는지 확인한다.
 
@@ -285,7 +289,7 @@ $ curl -H 'If-None-Match: "6c92edf1256d65b2"' .../posts/5  → 304 (본문 없�
 
 - ☐ 리소스는 복수 명사, 동사 금지, 수정은 PATCH, 삭제는 204, 생성은 201 + `Location`이라는 규칙을 말할 수 있다
 - ☐ 401/403, 400/409, 404의 구분을 예와 함께 설명할 수 있다
-- ☐ `#[utoipa::path]`로 문서를 만들고 `/docs`와 `/api-docs/openapi.json`을 열어 확인했다
+- ☐ `#[utoipa::path]`로 문서를 만들고 `/api-docs/`와 `/api-docs/openapi.json`을 열어 확인했다
 - ☐ `rename_all = "camelCase"`가 응답과 OpenAPI 스키마에 함께 반영되는 것을 확인했다
 - ☐ 오프셋과 커서 페이지네이션의 차이와 각각이 어울리는 곳을 설명할 수 있다
 - ☐ `limit` 상한과 `sort` 허용 목록을 **서버에서** 강제하는 이유를 안다

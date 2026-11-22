@@ -204,21 +204,23 @@ jobs:
 ### 3-4. 로컬에서 같은 명령을 먼저 돌려 본 결과
 
 ```
-demo     $ cargo test                                                      → 단위 7 + 통합 15 통과
+demo     $ cargo test                                                      → 단위 12 + 통합 31 통과
 demo     $ cargo check --no-default-features --features postgres           → Finished
-project  $ cargo test --workspace                                          → 도메인 서비스 5 + 유틸 1 통과 (SQLite·PostgreSQL·MySQL 드라이버 포함)
+project  $ cargo test --workspace                                          → domain 서비스 8 + 유틸 1, web 단위 6 + HTTP 20 통과 (SQLite·PostgreSQL·MySQL 드라이버 포함)
 lab      $ cargo test --lib --examples                                     → mock 3 + 서명 3 + 프롬프트/스트림 3 통과
 워크플로 YAML                                                               → 문법 검증 통과 (jobs: demo, project, lab / publish)
 ```
 
-**GitHub Actions 실제 실행 결과** (커밋 `50acec1` 푸시 직후, `ci` 워크플로 첫 실행): 세 job 모두 **success**.
+**GitHub Actions 실제 실행 결과** — 첫 실행(커밋 `50acec1` 푸시 직후)은 세 job 모두 **success**였고, 이후 스펙 v1 정렬 커밋(`1349aed` demo, `b511e9d` project)을 푸시했을 때도 `ci`가 모두 **success**였다. 마지막 실행(`b511e9d`)의 job별 결과:
 
 ```
-ci  completed success
-  demo     (sqlite 테스트 + postgres 빌드)   success     ← Ubuntu에서 cargo test + PostgreSQL feature 컴파일
-  project  (워크스페이스 테스트)              success     ← 도메인 서비스 시험 5 + 유틸 1
-  lab      (예제 컴파일 + 테스트)             success     ← mongodb·reqwest·ws 포함 전 예제 컴파일, 단위 테스트 9
+ci  completed success   (커밋 b511e9d)
+  demo     (sqlite 테스트 + postgres 빌드)   success  47초   ← Ubuntu에서 cargo test(단위 12 + 통합 31) + PostgreSQL feature 컴파일
+  project  (워크스페이스 테스트)              success  42초   ← domain 서비스 8 + web HTTP 20 + 단위 7
+  lab      (예제 컴파일 + 테스트)             success  13초   ← mongodb·reqwest·ws 포함 전 예제 컴파일, 단위 테스트 9
 ```
+
+첫 실행보다 훨씬 빠른 것은 `Swatinem/rust-cache`가 `target/`과 레지스트리를 캐시했기 때문이다. 의존성이 그대로이고 내 코드만 바뀌면 컴파일이 수십 초로 줄어든다.
 
 로컬(Windows)에서 통과한 것이 CI(Ubuntu)에서도 통과했다 — 경로 구분자·줄바꿈·설치된 도구에 의존하는 시험이 없다는 확인이기도 하다.
 
