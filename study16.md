@@ -4,7 +4,7 @@
 
 | 항목 | 내용 |
 |---|---|
-| 관련 파일 | [.github/workflows/ci.yml](.github/workflows/ci.yml), [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml), [demo/Dockerfile](demo/Dockerfile), [demo/compose.yaml](demo/compose.yaml), [demo/compose.postgres.yaml](demo/compose.postgres.yaml) |
+| 관련 파일 | 단계 예제 [lab/examples/s16_ops.rs](lab/examples/s16_ops.rs)(포트 3016), 실제 프로젝트: [.github/workflows/ci.yml](.github/workflows/ci.yml), [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml), [demo/Dockerfile](demo/Dockerfile), [demo/compose.yaml](demo/compose.yaml), [demo/compose.postgres.yaml](demo/compose.postgres.yaml) |
 | 로컬 검증 | 워크플로 YAML 문법 검증 + **워크플로가 실행하는 것과 같은 명령**(`cargo test`, `cargo check --no-default-features --features postgres`, `cargo test --workspace`, `cargo test --lib --examples`)을 로컬에서 실행해 통과 확인 · 백업/복원 실측(PostgreSQL, SQLite) |
 | GitHub에서의 실제 실행 | `ci.yml` 첫 실행 **3 job 모두 성공** (아래 ③-4). `docker-publish.yml`은 태그 푸시 때만 돌아서 아직 미실행 |
 
@@ -42,6 +42,280 @@
 ---
 
 ## ③ 🛠️ 실기
+
+### 3-0. 단계 예제 — [lab/examples/s16_ops.rs](lab/examples/s16_ops.rs) (포트 3016)
+
+운영에서 **서버 코드로 할 수 있는 장치**를 한 파일에 담았다. JSON(구조화) 로그, liveness와 readiness의 구분, `/metrics`, 그리고 백업은 **복원해 보는 것**이라는 것(SQLite WAL에서 `.db`만 복사하면 빈 DB). GitHub Actions 워크플로는 아래 3-2·3-3이다.
+
+```powershell
+cd lab
+cargo run --example s16_ops                                  # 사람이 읽는 로그
+$env:LOG_FORMAT = "json"; cargo run --example s16_ops        # JSON 로그
+cargo run --example s16_ops -- backup backup.db              # 안전한 백업(VACUUM INTO) 후 복원 검증
+cargo test --example s16_ops                                 # 시험 3개
+```
+
+```rust
+//! study16 — 운영 · CI/CD 중 **서버 코드로 할 수 있는 운영 장치**. 포트 3016.
+//!
+//!   ① 구조화(JSON) 로그        LOG_FORMAT=json — 로그 수집기가 필드로 검색한다
+//!   ② 헬스 두 종류             `/health`(살아 있나, liveness) vs `/ready`(DB까지 쓸 수 있나, readiness)
+//!   ③ 메트릭                   `/metrics` — 요청 수(상태 계열별)·처리 중 요청·누적 처리 시간 (Prometheus 텍스트)
+//!   ④ 백업은 **복원해 보는 것**   SQLite WAL에서 `.db`만 복사하면 빈 DB → `VACUUM INTO`가 안전한 방법
+//! (GitHub Actions 워크플로는 .github/workflows/ci.yml, docker-publish.yml)
+//!
+//! 실행:  cargo run --example s16_ops
+//!        LOG_FORMAT=json cargo run --example s16_ops
+//!        cargo run --example s16_ops -- backup backup.db      # 안전한 백업(VACUUM INTO) 후 복원 검증
+
+use std::{
+    path::Path,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use axum::{
+    Json, Router,
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::Next,
+    response::{IntoResponse, Response},
+    routing::get,
+};
+use serde::Deserialize;
+use serde_json::json;
+use sqlx::{
+    SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+};
+
+// ── ① 로그: 사람이 읽는 형식과 기계가 읽는 형식 ──────────────────────────────
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "s16_ops=info".into());
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    if std::env::var("LOG_FORMAT").as_deref() == Ok("json") {
+        builder.json().init(); // {"timestamp":..,"level":"INFO","fields":{"method":"GET","status":200,..}} — 필드로 검색·집계
+    } else {
+        builder.compact().init();
+    }
+}
+
+// ── ③ 메트릭 ───────────────────────────────────────────────────────────────
+#[derive(Default)]
+struct Metrics {
+    requests_2xx: AtomicU64,
+    requests_4xx: AtomicU64,
+    requests_5xx: AtomicU64,
+    in_flight: AtomicU64,
+    duration_micros_total: AtomicU64,
+}
+
+impl Metrics {
+    fn render(&self) -> String {
+        // Prometheus 텍스트 형식: 줄마다 `이름{라벨} 값`. 수집기가 주기적으로 긁어 간다
+        format!(
+            "# TYPE http_requests_total counter\n\
+             http_requests_total{{class=\"2xx\"}} {}\n\
+             http_requests_total{{class=\"4xx\"}} {}\n\
+             http_requests_total{{class=\"5xx\"}} {}\n\
+             # TYPE http_requests_in_flight gauge\n\
+             http_requests_in_flight {}\n\
+             # TYPE http_request_duration_seconds_sum counter\n\
+             http_request_duration_seconds_sum {:.6}\n",
+            self.requests_2xx.load(Ordering::Relaxed),
+            self.requests_4xx.load(Ordering::Relaxed),
+            self.requests_5xx.load(Ordering::Relaxed),
+            self.in_flight.load(Ordering::Relaxed),
+            self.duration_micros_total.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        )
+    }
+}
+
+#[derive(Clone)]
+struct AppState {
+    db: SqlitePool,
+    metrics: Arc<Metrics>,
+}
+
+/// 모든 요청을 세고 재는 미들웨어. 로그도 여기서 **구조화된 필드**로 남긴다.
+async fn track(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let (method, path) = (request.method().clone(), request.uri().path().to_string());
+    state.metrics.in_flight.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+
+    let response = next.run(request).await;
+
+    let elapsed = started.elapsed();
+    state.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
+    state.metrics.duration_micros_total.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+    let status = response.status();
+    let counter = match status.as_u16() {
+        200..=299 => &state.metrics.requests_2xx,
+        400..=499 => &state.metrics.requests_4xx,
+        500..=599 => &state.metrics.requests_5xx,
+        _ => return response,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+
+    // 문자열을 이어 붙이지 않고 필드로 남긴다 → JSON 로그에서 status > 499 같은 조건으로 검색
+    tracing::info!(%method, %path, status = status.as_u16(), elapsed_ms = elapsed.as_millis() as u64, "request");
+    response
+}
+
+// ── ② 헬스 두 종류 ─────────────────────────────────────────────────────────
+/// liveness: 프로세스가 살아 있나. 여기가 실패하면 **재시작**이 답이다. DB를 보지 않는다
+/// (DB가 죽었다고 앱을 재시작해 봐야 소용없고, 재시작 폭풍만 만든다)
+async fn health() -> Json<serde_json::Value> {
+    Json(json!({ "status": "ok" }))
+}
+
+/// readiness: 지금 요청을 받을 수 있나. 실패하면 **트래픽에서 빼는** 것이 답이다. DB까지 확인한다
+async fn ready(State(state): State<AppState>) -> Response {
+    match sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.db).await {
+        Ok(_) => Json(json!({ "status": "ready" })).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "readiness 실패");
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "status": "unavailable" }))).into_response()
+        }
+    }
+}
+
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], state.metrics.render())
+}
+
+#[derive(Deserialize)]
+struct NewNote {
+    text: String,
+}
+
+async fn add_note(State(state): State<AppState>, Json(body): Json<NewNote>) -> Result<StatusCode, StatusCode> {
+    sqlx::query("INSERT INTO notes (text) VALUES ($1)").bind(body.text).execute(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::CREATED)
+}
+
+async fn count_notes(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notes").fetch_one(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({ "data": { "notes": n } })))
+}
+
+fn app(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/metrics", get(metrics))
+        .route("/api/notes", get(count_notes).post(add_note))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), track))
+        .with_state(state)
+}
+
+// ── DB 연결과 ④ 백업 ───────────────────────────────────────────────────────
+async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
+    let in_memory = url.contains(":memory:");
+    let mut options = SqliteConnectOptions::from_str(url)?.create_if_missing(true).busy_timeout(Duration::from_secs(5));
+    if !in_memory {
+        options = options.journal_mode(SqliteJournalMode::Wal); // 읽기·쓰기가 서로 막지 않는다. 대신 최근 쓰기는 -wal 파일에 있다
+    }
+    let pool = SqlitePoolOptions::new().max_connections(if in_memory { 1 } else { 5 }).connect_with(options).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL)").execute(&pool).await?;
+    Ok(pool)
+}
+
+/// 일관된 스냅샷을 **새 파일 하나**로 만든다. 서버를 멈추지 않아도 된다.
+/// (`.db` 파일만 복사하면 -wal에 있는 최근 쓰기가 빠진다. 대상 파일은 미리 있으면 안 된다)
+async fn backup_to(db: &SqlitePool, dest: &Path) -> anyhow::Result<()> {
+    sqlx::query("VACUUM INTO $1").bind(dest.to_string_lossy().to_string()).execute(db).await?;
+    Ok(())
+}
+
+/// 복원 리허설: 백업 파일을 **새로 열어** 보고 안에 데이터가 있는지 센다. 백업은 복원해 봐야 백업이다.
+async fn verify_restore(path: &Path) -> anyhow::Result<i64> {
+    let restored = connect(&format!("sqlite://{}?mode=rw", path.display())).await?;
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notes").fetch_one(&restored).await?;
+    restored.close().await;
+    Ok(n)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    init_tracing();
+    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://s16.db?mode=rwc".into());
+    let db = connect(&url).await?;
+
+    // `cargo run --example s16_ops -- backup out.db`
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [cmd, dest] = args.as_slice() && cmd == "backup" {
+        let started = Instant::now();
+        backup_to(&db, Path::new(dest)).await?;
+        let rows = verify_restore(Path::new(dest)).await?;
+        println!("백업 {dest} 완료, 복원 검증: notes {rows}건 ({}ms)", started.elapsed().as_millis());
+        return Ok(());
+    }
+
+    let state = AppState { db, metrics: Arc::default() };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3016").await?;
+    tracing::info!(addr = %listener.local_addr()?, "listening");
+    axum::serve(listener, app(state)).await?;
+    Ok(())
+}
+```
+
+시험 코드는 같은 파일 아래쪽의 `#[cfg(test)] mod tests`에 있다: [s16_ops.rs](lab/examples/s16_ops.rs).
+
+| 코드 | 설명 |
+|---|---|
+| `LOG_FORMAT=json` → `builder.json()` | 로그를 문장이 아니라 **필드**로 남긴다. 수집기에서 `status > 499` 같은 조건으로 검색·집계할 수 있다 |
+| `tracing::info!(%method, %path, status = …, elapsed_ms = …, "request")` | 문자열을 이어 붙이지 않고 필드로 넘긴다. **비밀번호·토큰은 필드에 넣지 않는다** |
+| `Metrics` + `AtomicU64` | 락 없이 카운터를 올린다. `Relaxed` 순서면 충분하다 (정확한 순서가 아니라 합계만 필요) |
+| `track` 미들웨어 (`from_fn_with_state`) | 모든 요청을 세고(상태 계열별) 시간을 재고 `in_flight`를 올렸다 내린다. 로그도 여기서 한 번에 |
+| `/metrics`의 Prometheus 텍스트 | `이름{라벨} 값` 줄. 수집기가 주기적으로 긁어 간다. 요청 수는 **누적 counter**, 처리 중 요청은 **gauge** |
+| `/health` (liveness) | 프로세스가 살아 있나. 실패하면 **재시작**이 답이다. **DB를 보지 않는다** — DB가 죽었다고 앱을 재시작해 봐야 소용없고 재시작 폭풍만 만든다 |
+| `/ready` (readiness) | 지금 요청을 받을 수 있나(DB까지). 실패하면 **트래픽에서 빼는** 것이 답이다. 실패는 503 |
+| `journal_mode(Wal)` | 읽기·쓰기가 서로 막지 않는다. 대신 **최근 쓰기는 `-wal` 파일에 있다** — 이것이 백업 함정의 원인 |
+| `backup_to` = `VACUUM INTO $1` | 서버를 멈추지 않고 **일관된 스냅샷을 새 파일 하나로** 만든다. 대상 파일은 미리 있으면 안 된다 |
+| `verify_restore` | 백업 파일을 **새로 열어** 데이터를 센다. 받는 것이 아니라 **복원해 보는 것**이 백업이다. 걸린 시간이 RTO의 첫 근사치 |
+| `cargo run --example s16_ops -- backup out.db` | 같은 코드를 CLI로. `let [cmd, dest] = args.as_slice() && cmd == "backup"` (let-chain, edition 2024) |
+
+**실행 결과** (직접 실행한 결과):
+
+```
+$ LOG_FORMAT=json cargo run --example s16_ops   (글 3개 작성 후)
+$ curl .../health        {"status":"ok"}               $ curl .../ready   {"status":"ready"}
+$ curl .../api/notes     {"data":{"notes":3}}          $ curl .../nope    → 404
+$ curl .../metrics
+# TYPE http_requests_total counter
+http_requests_total{class="2xx"} 6
+http_requests_total{class="4xx"} 1
+http_requests_total{class="5xx"} 0
+# TYPE http_requests_in_flight gauge
+http_requests_in_flight 1                                    ← 이 /metrics 요청 자신이 처리 중
+# TYPE http_request_duration_seconds_sum counter
+http_request_duration_seconds_sum 0.006553
+
+JSON 로그 (마지막 2줄):
+{"timestamp":"2026-11-22T18:58:13.544650Z","level":"INFO","fields":{"message":"request","method":"GET","path":"/nope","status":404,"elapsed_ms":0},"target":"s16_ops"}
+{"timestamp":"2026-11-22T18:58:13.778160Z","level":"INFO","fields":{"message":"request","method":"GET","path":"/metrics","status":200,"elapsed_ms":0},"target":"s16_ops"}
+
+서버가 떠 있는 동안의 파일:  s16.db  s16.db-shm  s16.db-wal               ← 최근 쓰기는 -wal에 있다
+$ s16.db만 복사해서 열기  →  no such table: notes                         ← ❌ 테이블이 없는 DB (WAL의 쓰기가 빠졌다)
+$ cargo run --example s16_ops -- backup backup.db    (같은 DB, 서버는 계속 실행 중)
+백업 …/backup.db 완료, 복원 검증: notes 3건 (23ms)                           ← ✅ VACUUM INTO. 서버를 멈추지 않고, 복원해서 3건 확인
+```
+
+시험 (`cargo test --example s16_ops`):
+
+```
+test tests::메트릭은_상태_계열별로_요청을_센다 ... ok
+test tests::liveness는_db와_무관하고_readiness는_db가_죽으면_503이다 ... ok     ← 풀을 닫아도 /health는 200, /ready는 503
+test tests::db_파일만_복사하면_빈_db고_vacuum_into는_복원된다 ... ok
+test result: ok. 3 passed
+```
+
+아래 3-1부터는 이 개념이 실제 프로젝트(`demo/`)에서 어떤 모양이 되는지 이어서 본다.
 
 ### 3-1. Docker · compose 운영 체크리스트
 
@@ -340,6 +614,7 @@ DB와 **한 세트**다. DB에는 파일명만 있고 파일이 없으면 깨진
 1. **CI를 일부러 깨 보기**: 브랜치에서 통합 테스트 하나의 기대값을 틀리게 바꿔 PR을 올리고, Actions에서 어느 job·어느 시험이 실패하는지 읽는다. 고치면 초록으로 돌아오는지 본다.
 2. **복원 리허설**: PostgreSQL `pg_dump` → 완전히 새 컨테이너/DB로 `pg_restore` → `axum-demo:pg` 이미지를 그 DB에 붙여 가입·조회가 되는지 확인한다. 걸린 시간을 적는다 (RTO).
 3. **JSON 로그**: `tracing-subscriber`의 `json` feature를 켜고 `.json()` 포매터로 바꿔, 로그 한 줄을 `python -m json.tool`로 파싱해 본다. `requestId`로 필터하는 `grep`/`jq` 한 줄을 만든다.
+4. **단계 예제로 실험**: `s16_ops`의 `backup_to`를 `std::fs::copy`로 바꾸고 `cargo run --example s16_ops -- backup out.db`를 실행한다. `verify_restore`가 어떻게 실패하는지 보고, 왜 "백업은 복원해 봐야 백업"인지 설명해 본다.
 
 ---
 
@@ -354,6 +629,7 @@ DB와 **한 세트**다. DB에는 파일명만 있고 파일이 없으면 깨진
 - ☐ 로그·요청 ID·헬스로 장애를 추적하는 절차를 설명할 수 있다
 - ☐ **SQLite WAL에서 `.db` 파일만 복사하면 안 되는 이유**와 안전한 방법 두 가지를 안다
 - ☐ 백업을 받은 뒤 **새 환경에 복원해 앱을 붙여 보았다**
+- ☐ `cargo run --example s16_ops`로 `/metrics`·`/ready`·JSON 로그를 확인하고, `.db`만 복사하면 `no such table`이 나오는 것과 `VACUUM INTO` 백업이 복원되는 것을 직접 확인했다
 
 ---
 
