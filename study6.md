@@ -4,7 +4,7 @@
 
 | 항목 | 내용 |
 |---|---|
-| 관련 코드 | [demo/src/db.rs](demo/src/db.rs), [demo/src/posts/](demo/src/posts/), [demo/src/comments/](demo/src/comments/), [demo/src/response.rs](demo/src/response.rs), [demo/src/pagination.rs](demo/src/pagination.rs), [demo/src/error.rs](demo/src/error.rs), [demo/src/middleware.rs](demo/src/middleware.rs), [demo/src/ratelimit.rs](demo/src/ratelimit.rs), [demo/src/config.rs](demo/src/config.rs), [demo/migrations/](demo/migrations/) |
+| 관련 코드 | 단계 예제 [lab/examples/s06_db.rs](lab/examples/s06_db.rs)(포트 3006), 실제 프로젝트: [demo/src/db.rs](demo/src/db.rs), [demo/src/posts/](demo/src/posts/), [demo/src/comments/](demo/src/comments/), [demo/src/response.rs](demo/src/response.rs), [demo/src/pagination.rs](demo/src/pagination.rs), [demo/src/error.rs](demo/src/error.rs), [demo/src/middleware.rs](demo/src/middleware.rs), [demo/src/ratelimit.rs](demo/src/ratelimit.rs), [demo/src/config.rs](demo/src/config.rs), [demo/migrations/](demo/migrations/) |
 | 이 단계의 코드 변경 | `/api` 경로 · `{ data, meta }` 응답 · 스펙 v1 오류 본문 · camelCase · 이메일 로그인 · 댓글 · 정렬 · 호출 제한(429) · `CORS_ORIGIN` (단위 12 + 통합 31 테스트 통과) |
 | 버전 | axum 0.8.9, **sqlx 0.9** (`query`/`query_as`는 리터럴 SQL만 받음) |
 
@@ -69,6 +69,374 @@ async fn get_one(...) -> AppResult<Json<Data<Post>>>        // Result<Json<Data<
 ---
 
 ## ③ 🛠️ 실기
+
+### 3-0. 단계 예제 — [lab/examples/s06_db.rs](lab/examples/s06_db.rs) (포트 3006)
+
+DB를 붙인 CRUD에서 **이 단계가 가르치는 것만** 한 파일에 담았다. 인증·댓글·호출 제한이 붙은 실제 모양은 아래 3-1부터의 `demo/`다. 이 예제는 `sqlx::migrate!`가 읽는 SQL 두 개([0001](lab/examples/s06_migrations/0001_create_posts.sql), [0002](lab/examples/s06_migrations/0002_add_tags.sql))와 함께 돈다.
+
+```powershell
+cd lab
+cargo run --example s06_db                                              # 메모리 DB (끝나면 사라진다)
+$env:DATABASE_URL = "sqlite://s06.db?mode=rwc"; cargo run --example s06_db   # 파일 DB (재시작해도 남는다)
+cargo test --example s06_db                                             # 시험 3개
+```
+
+```rust
+//! study6 — DB · API 연동 (CRUD). 포트 3006.
+//!
+//! 한 단계에서 배우는 것만 담았다: sqlx + SQLite, 마이그레이션, 3-타입(요청 DTO / DB 행 / 응답),
+//! `INSERT … RETURNING`, `COALESCE` 부분 수정, `rows_affected`, `QueryBuilder` 검색,
+//! 오류를 값으로(`AppError` + `IntoResponse`), 연결 정보를 환경변수로.
+//! (인증·댓글·호출 제한이 붙은 실제 모양은 demo/)
+//!
+//! 실행:  cargo run --example s06_db
+//!        DATABASE_URL="sqlite://s06.db?mode=rwc" cargo run --example s06_db   # 파일에 저장 (재시작해도 남는다)
+
+use std::{str::FromStr, time::Duration};
+
+use axum::{
+    Json, Router,
+    extract::{FromRequest, Path, Query, Request, State, rejection::JsonRejection},
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::get,
+};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sqlx::{
+    FromRow, QueryBuilder, Sqlite, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+};
+use validator::Validate;
+
+// ── 연결 + 마이그레이션 ────────────────────────────────────────────────────
+async fn init_db(url: &str) -> anyhow::Result<SqlitePool> {
+    // 메모리 DB는 연결마다 별개의 DB다 → 연결을 1개로 고정하지 않으면 시험이 랜덤하게 `no such table`
+    let in_memory = url.contains(":memory:") || url.contains("mode=memory");
+
+    let mut options = SqliteConnectOptions::from_str(url)?
+        .create_if_missing(true) // 기본값 false → 첫 실행부터 "unable to open database file"
+        .busy_timeout(Duration::from_secs(5)); // 기본 0 → 동시 쓰기에서 "database is locked"
+    if !in_memory {
+        options = options.journal_mode(SqliteJournalMode::Wal); // 읽기·쓰기가 서로를 막지 않는다
+    }
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(if in_memory { 1 } else { 5 })
+        .connect_with(options)
+        .await?;
+
+    // 컴파일 시점에 .sql 파일을 바이너리에 박아 넣는다 → 배포 이미지에 폴더가 없어도 된다
+    sqlx::migrate!("./examples/s06_migrations").run(&pool).await?;
+    Ok(pool)
+}
+
+// ── 3-타입: DB 행 / 응답 / 요청 ────────────────────────────────────────────
+/// DB의 한 행. tags가 JSON 문자열이라 API 모양과 다르다.
+#[derive(Debug, FromRow)]
+struct PostRow {
+    id: i64,
+    title: String,
+    body: String,
+    tags: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+/// API 응답. 직렬화 경계에서만 camelCase로 바뀐다.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Post {
+    id: i64,
+    title: String,
+    body: String,
+    tags: Vec<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl From<PostRow> for Post {
+    fn from(row: PostRow) -> Self {
+        Self {
+            id: row.id,
+            title: row.title,
+            body: row.body,
+            tags: serde_json::from_str(&row.tags).unwrap_or_default(), // 깨진 JSON이어도 500 대신 빈 배열
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
+struct CreatePost {
+    #[validate(length(min = 1, max = 100, message = "제목은 1~100자여야 합니다"))]
+    title: String,
+    #[validate(length(min = 1, max = 5000, message = "본문은 1~5000자여야 합니다"))]
+    body: String,
+    #[serde(default)]
+    #[validate(length(max = 5, message = "태그는 최대 5개까지 가능합니다"))]
+    tags: Vec<String>,
+}
+
+/// 모든 필드가 Option → 부분 수정(PATCH). None = "안 보냈다" = 기존 값 유지
+#[derive(Debug, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
+struct UpdatePost {
+    #[validate(length(min = 1, max = 100, message = "제목은 1~100자여야 합니다"))]
+    title: Option<String>,
+    #[validate(length(min = 1, max = 5000, message = "본문은 1~5000자여야 합니다"))]
+    body: Option<String>,
+    #[validate(length(max = 5, message = "태그는 최대 5개까지 가능합니다"))]
+    tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Validate)]
+struct ListQuery {
+    #[serde(default = "one")]
+    #[validate(range(min = 1, message = "page는 1 이상이어야 합니다"))]
+    page: i64,
+    #[serde(default = "ten")]
+    #[validate(range(min = 1, message = "limit는 1 이상이어야 합니다"))]
+    limit: i64, // 상한(50)은 오류가 아니라 보정이다 — 아래 list()
+    q: Option<String>,
+}
+fn one() -> i64 {
+    1
+}
+fn ten() -> i64 {
+    10
+}
+
+// ── 오류는 값이다 ──────────────────────────────────────────────────────────
+#[derive(Debug, thiserror::Error)]
+enum AppError {
+    #[error("post {0} not found")]
+    NotFound(i64),
+    #[error("{0}")]
+    BadRequest(String),
+    #[error("validation failed")]
+    Validation(validator::ValidationErrors),
+    // #[from] 덕분에 sqlx 오류가 `?` 한 글자로 여기로 들어온다
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, code, message, fields) = match &self {
+            Self::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND", self.to_string(), None),
+            Self::BadRequest(m) => (StatusCode::BAD_REQUEST, "BAD_REQUEST", m.clone(), None),
+            Self::Validation(errors) => {
+                let fields: serde_json::Map<_, _> = errors
+                    .field_errors()
+                    .into_iter()
+                    .map(|(f, errs)| {
+                        let msgs: Vec<_> = errs.iter().filter_map(|e| e.message.as_ref().map(|m| m.to_string())).collect();
+                        (f.to_string(), json!(msgs))
+                    })
+                    .collect();
+                (StatusCode::BAD_REQUEST, "VALIDATION_ERROR", "입력값을 확인하세요.".into(), Some(fields))
+            }
+            // 500은 내부 사정을 밖으로 흘리지 않는다. 원인은 서버 로그에만.
+            Self::Database(e) => {
+                eprintln!("database error: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", "서버 내부 오류가 발생했습니다.".into(), None)
+            }
+        };
+        let mut error = json!({ "code": code, "message": message });
+        if let Some(fields) = fields {
+            error["fields"] = fields.into();
+        }
+        (status, Json(json!({ "error": error }))).into_response()
+    }
+}
+
+type AppResult<T> = Result<T, AppError>;
+
+/// Json<T> + validator를 한 번에. 본문 extractor라서 핸들러의 마지막 인자여야 한다.
+struct ValidatedJson<T>(T);
+
+impl<T, S> FromRequest<S> for ValidatedJson<T>
+where
+    T: serde::de::DeserializeOwned + Validate,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let Json(value) = Json::<T>::from_request(req, state)
+            .await
+            .map_err(|e: JsonRejection| AppError::BadRequest(e.body_text()))?;
+        value.validate().map_err(AppError::Validation)?;
+        Ok(Self(value))
+    }
+}
+
+// ── repo: SQL을 직접 쓴다 (sqlx는 ORM이 아니다) ─────────────────────────────
+async fn find(db: &SqlitePool, id: i64) -> Result<Option<PostRow>, sqlx::Error> {
+    // sqlx 0.9: query_as는 &'static str만 받는다. format!로 SQL을 조립하면 컴파일 에러(SqlSafeStr)
+    sqlx::query_as::<_, PostRow>("SELECT id, title, body, tags, created_at, updated_at FROM posts WHERE id = $1")
+        .bind(id) // 값은 SQL 문자열에 끼워 넣지 않고 바인딩한다 → SQL 인젝션 방어
+        .fetch_optional(db) // 0건이면 Ok(None) → 핸들러가 404로
+        .await
+}
+
+// ── 핸들러 ─────────────────────────────────────────────────────────────────
+async fn list(State(db): State<SqlitePool>, Query(q): Query<ListQuery>) -> AppResult<Json<serde_json::Value>> {
+    q.validate().map_err(AppError::Validation)?;
+    let limit = q.limit.min(50); // 스펙: 50 초과는 오류가 아니라 50으로 보정
+    let keyword = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    // 조건이 동적이면 QueryBuilder. SQL 조각과 바인딩 값을 따로 쌓아 값이 SQL에 섞이지 않는다.
+    let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM posts WHERE 1 = 1");
+    let mut rows = QueryBuilder::<Sqlite>::new("SELECT id, title, body, tags, created_at, updated_at FROM posts WHERE 1 = 1");
+    for builder in [&mut count, &mut rows] {
+        if let Some(k) = keyword {
+            let pattern = format!("%{k}%");
+            // LOWER(..) LIKE LOWER(..): SQLite는 LIKE가 대소문자를 무시하지만 PostgreSQL은 구분한다 → 명시적으로 맞춘다
+            builder.push(" AND (LOWER(title) LIKE LOWER(").push_bind(pattern.clone());
+            builder.push(") OR LOWER(body) LIKE LOWER(").push_bind(pattern).push("))");
+        }
+    }
+    let total: i64 = count.build_query_scalar().fetch_one(&db).await?;
+    rows.push(" ORDER BY id DESC LIMIT ").push_bind(limit);
+    rows.push(" OFFSET ").push_bind((q.page - 1) * limit);
+    let items: Vec<Post> = rows.build_query_as::<PostRow>().fetch_all(&db).await?.into_iter().map(Post::from).collect();
+
+    Ok(Json(json!({
+        "data": items,
+        "meta": { "page": q.page, "limit": limit, "total": total, "totalPages": (total + limit - 1) / limit, "q": keyword },
+    })))
+}
+
+async fn get_one(State(db): State<SqlitePool>, Path(id): Path<i64>) -> AppResult<Json<serde_json::Value>> {
+    let row = find(&db, id).await?.ok_or(AppError::NotFound(id))?;
+    Ok(Json(json!({ "data": Post::from(row) })))
+}
+
+async fn create(State(db): State<SqlitePool>, ValidatedJson(body): ValidatedJson<CreatePost>) -> AppResult<impl IntoResponse> {
+    let now = Utc::now();
+    let tags = serde_json::to_string(&body.tags).unwrap_or_else(|_| "[]".into());
+    // RETURNING: INSERT와 조회를 한 번에 끝낸다
+    let row: PostRow = sqlx::query_as(
+        "INSERT INTO posts (title, body, tags, created_at, updated_at) VALUES ($1, $2, $3, $4, $4)
+         RETURNING id, title, body, tags, created_at, updated_at",
+    )
+    .bind(&body.title)
+    .bind(&body.body)
+    .bind(tags)
+    .bind(now)
+    .fetch_one(&db)
+    .await?;
+
+    let location = format!("/api/posts/{}", row.id);
+    Ok((StatusCode::CREATED, [(header::LOCATION, location)], Json(json!({ "data": Post::from(row) }))))
+}
+
+async fn update(State(db): State<SqlitePool>, Path(id): Path<i64>, ValidatedJson(body): ValidatedJson<UpdatePost>) -> AppResult<Json<serde_json::Value>> {
+    let tags = body.tags.as_ref().map(|t| serde_json::to_string(t).unwrap_or_else(|_| "[]".into()));
+    // COALESCE($1, title): 바인딩 값이 NULL이면 기존 값을 쓴다 → 필드 조합마다 SQL을 따로 만들지 않아도 PATCH가 된다
+    let row: Option<PostRow> = sqlx::query_as(
+        "UPDATE posts SET title = COALESCE($1, title), body = COALESCE($2, body), tags = COALESCE($3, tags), updated_at = $4
+         WHERE id = $5 RETURNING id, title, body, tags, created_at, updated_at",
+    )
+    .bind(body.title)
+    .bind(body.body)
+    .bind(tags)
+    .bind(Utc::now())
+    .bind(id)
+    .fetch_optional(&db)
+    .await?;
+    let row = row.ok_or(AppError::NotFound(id))?;
+    Ok(Json(json!({ "data": Post::from(row) })))
+}
+
+async fn delete(State(db): State<SqlitePool>, Path(id): Path<i64>) -> AppResult<StatusCode> {
+    let result = sqlx::query("DELETE FROM posts WHERE id = $1").bind(id).execute(&db).await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound(id)); // 실제로 지워졌는지 확인 → 없는 id면 404
+    }
+    Ok(StatusCode::NO_CONTENT) // 삭제는 204 + 본문 없음
+}
+
+fn app(db: SqlitePool) -> Router {
+    Router::new()
+        .route("/api/posts", get(list).post(create))
+        .route("/api/posts/{id}", get(get_one).patch(update).delete(delete))
+        .with_state(db)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // 연결 정보는 코드가 아니라 환경변수로. 없으면 개발용 기본값(메모리 DB)
+    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite::memory:".into());
+    let db = init_db(&url).await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3006").await?;
+    println!("s06_db  http://127.0.0.1:3006/api/posts   (DATABASE_URL={url})");
+    axum::serve(listener, app(db)).await?;
+    Ok(())
+}
+```
+
+시험 코드는 같은 파일 아래쪽의 `#[cfg(test)] mod tests`에 있다: [s06_db.rs](lab/examples/s06_db.rs).
+
+| 코드 | 설명 |
+|---|---|
+| `create_if_missing(true)` · `busy_timeout` · `journal_mode(Wal)` | 기본값이 false / 0 / 롤백 저널이라 첫 실행부터 `unable to open database file`, 동시 쓰기에서 `database is locked`. WAL은 읽기·쓰기가 서로 막지 않게 한다 |
+| `in_memory`면 `max_connections(1)` | 메모리 DB는 **연결마다 별개의 DB**. 풀이 둘 이상이면 시험이 랜덤하게 `no such table` |
+| `sqlx::migrate!("./examples/s06_migrations")` | **컴파일 시점에** `.sql`을 바이너리에 박는다. `0002`는 `0001`을 고치지 않고 **새 파일로 쌓은** 것이다 (적용된 파일을 고치면 `VersionMismatch`) |
+| `PostRow` → `Post` → `CreatePost`/`UpdatePost` | DB 행(tags가 JSON 문자열) / 응답(camelCase, tags 배열) / 입력(검증 규칙)을 **섞지 않는다**. 경계에서만 `From`으로 변환 |
+| `deny_unknown_fields` | 모르는 필드(예: 클라이언트가 보낸 `author`)는 거절 |
+| `UpdatePost`의 모든 필드가 `Option` | `None` = "안 보냈다" = 기존 값 유지 (PATCH 의미) |
+| `AppError` + `#[from] sqlx::Error` + `IntoResponse` | 실패는 반환 타입에 적힌 **값**. `?` 한 글자로 sqlx 오류가 500 JSON까지 흐르고, 응답에는 고정 문구만 (원인은 서버 로그에) |
+| `ValidatedJson` | `Json` 파싱 + `validator`를 한 번에. **본문 extractor라서 핸들러의 마지막 인자** |
+| `query_as(..).bind(id).fetch_optional` | `$1` 바인딩 → SQL 인젝션 방어. 0건이면 `Ok(None)` → 404. sqlx 0.9는 `&'static str`만 받는다(`format!` 금지) |
+| `QueryBuilder` + `push_bind` | 조건이 동적일 때. SQL 조각과 값을 따로 쌓아 값이 SQL에 섞이지 않는다. 같은 조건을 건수 쿼리와 목록 쿼리에 **둘 다** 적용 |
+| `LOWER(col) LIKE LOWER(?)` | SQLite의 `LIKE`는 대소문자를 무시하지만 PostgreSQL은 구분 — 명시적으로 맞춰 DB를 바꿔도 같은 결과 |
+| `q.limit.min(50)` | 스펙 §4: 50 초과는 **오류가 아니라 보정**. 반면 `limit=0`은 범위 밖이라 `VALIDATION_ERROR` |
+| `INSERT … RETURNING` | INSERT 후 SELECT를 한 번 더 하지 않는다 |
+| `COALESCE($1, title)` | 필드 조합마다 SQL을 따로 만들지 않아도 PATCH가 된다 |
+| `rows_affected() == 0` → 404 | 실제로 지워졌는지 확인. 삭제 성공은 **204 + 본문 없음** |
+| `DATABASE_URL` | 연결 정보는 코드가 아니라 환경변수. 없으면 개발용 기본값 |
+
+**실행 결과** (직접 실행한 결과):
+
+```
+s06_db  http://127.0.0.1:3006/api/posts   (DATABASE_URL=sqlite::memory:)
+
+$ curl -i -X POST .../api/posts -d '{"title":"Hello Axum","body":"Rust Axum SQLite","tags":["rust","axum"]}'
+HTTP/1.1 201 Created
+location: /api/posts/1
+{"data":{"id":1,"title":"Hello Axum","body":"Rust Axum SQLite","tags":["rust","axum"],"createdAt":"2026-11-22T18:56:51.717254Z","updatedAt":"2026-11-22T18:56:51.717254Z"}}
+
+$ curl -X PATCH .../api/posts/1 -d '{"title":"Hello Axum 2"}'                  # 제목만 보냈다
+{"data":{"id":1,"title":"Hello Axum 2","body":"Rust Axum SQLite","tags":["rust","axum"],...,"updatedAt":"2026-11-22T18:56:51.964846800Z"}}   ← body·tags는 그대로, updatedAt만 갱신
+
+$ curl ".../api/posts?q=AXUM&limit=999"
+{'page': 1, 'limit': 50, 'total': 1, 'totalPages': 1, 'q': 'AXUM'}  ['Hello Axum 2']     ← 대소문자 무시, limit 999 → 50
+$ curl ".../api/posts?q=%27%20OR%201%3D1%20--"                                            ← SQL 인젝션 시도
+{'page': 1, 'limit': 10, 'total': 0, 'totalPages': 0, 'q': "' OR 1=1 --"}                ← 전체가 쏟아지지 않는다. 그냥 검색어다
+
+$ curl -X POST .../api/posts -d '{"title":"","body":""}'
+{"error":{"code":"VALIDATION_ERROR","message":"입력값을 확인하세요.","fields":{"title":["제목은 1~100자여야 합니다"],"body":["본문은 1~5000자여야 합니다"]}}}
+$ curl .../api/posts/99                                         → 404 {"error":{"code":"NOT_FOUND","message":"post 99 not found"}}
+$ curl -X DELETE .../api/posts/1  (두 번)                       → 204, 404
+
+파일 DB(DATABASE_URL=sqlite://…?mode=rwc)로 글 1개 작성 → 서버 종료 → 다시 실행 → 목록 total 1   ← 재시작 후에도 남는다
+```
+
+시험 (`cargo test --example s06_db`):
+
+```
+test tests::crud_흐름과_부분_수정 ... ok
+test tests::검색은_대소문자를_무시하고_인젝션은_검색어일_뿐이다 ... ok
+test tests::limit은_50으로_보정되고_검증_실패는_fields를_준다 ... ok
+test result: ok. 3 passed
+```
+
+아래 3-1부터는 이 개념이 실제 프로젝트(`demo/`)에서 어떤 모양이 되는지 이어서 본다.
 
 ### 3-1. 연결 설정 — [demo/src/db.rs](demo/src/db.rs) (SQLite 부분)
 
@@ -670,6 +1038,7 @@ POST /api/auth/login  (본문 '{bad') → 400 {"error":{"code":"BAD_REQUEST","me
 1. **두 가지 409 구분**: 같은 이메일로, 그다음 같은 닉네임·다른 이메일로 가입해 `EMAIL_TAKEN`과 `CONFLICT`가 나오는지 `curl`로 확인한다. 그다음 [demo/src/auth/handler.rs](demo/src/auth/handler.rs)의 `map_unique_violation`에서 `message.contains("nickname")` 줄을 지우면 어떤 시험이 깨지는지 `cargo test`로 본다.
 2. **정렬이 바뀌는 걸 눈으로**: 글 3개를 만들고 `?sort=-commentCount`로 목록을 본다. 가장 오래된 글에 댓글을 달면 순서가 어떻게 바뀌는지 확인하고, 같은 댓글 수일 때는 최신순인지도 본다.
 3. **429 재현**: `RATE_LIMIT_PER_MINUTE=5`로 서버를 띄우고 `/api/posts`를 6번 부른다. `Retry-After`가 몇 초인지 보고, 그 시간만큼 기다린 뒤 다시 200이 되는지 확인한다. `into_make_service_with_connect_info` 줄을 지우면 어떻게 달라지는지도 해 본다.
+4. **단계 예제로 실험**: `s06_db`에서 `s06_migrations/0001_create_posts.sql`의 컬럼 하나를 일부러 고치고 다시 실행해 `VersionMismatch`를 보고, 원래대로 되돌린 뒤 **새 파일** `0003_add_views.sql`로 컬럼을 추가한다 (적용된 마이그레이션은 고치지 않고 쌓는다는 규칙을 몸으로 확인).
 
 ---
 
@@ -687,6 +1056,7 @@ POST /api/auth/login  (본문 '{bad') → 400 {"error":{"code":"BAD_REQUEST","me
 - ☐ 응답 JSON은 `#[serde(rename_all = "camelCase")]`
 - ☐ `{ data }` / `{ data, meta }` 껍데기와 `limit` 상한(50으로 **보정**)·`sort` 허용 목록이 코드로 옮겨져 있다
 - ☐ 호출 제한이 IP마다 따로 세어지고, 429에 `Retry-After`가 붙는 것을 확인했다 (`ConnectInfo`가 필요한 이유를 안다)
+- ☐ `cargo run --example s06_db`를 실행해 CRUD·검색·인젝션 시도·`limit` 보정·검증 실패를 `curl`로 직접 확인했다 (파일 DB로 재시작 후 데이터가 남는 것까지)
 
 ---
 
