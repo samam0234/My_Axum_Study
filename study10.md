@@ -231,8 +231,8 @@ $ docker exec axum-demo id
 uid=1000(appuser) gid=1000(appuser) groups=1000(appuser)
 
 # 글을 하나 만들고 → 컨테이너를 지우고 → 같은 볼륨으로 새 컨테이너를 띄운다
-$ curl "http://127.0.0.1:3200/posts"
-posts after recreate: 1 ['in container']                  ← 데이터가 볼륨에 남아 있다
+$ curl "http://127.0.0.1:3200/api/posts"
+posts after recreate: 1 ['in container']                  ← 데이터가 볼륨에 남아 있다 (data.meta.total = 1)
 
 # 비밀키가 짧으면 부팅을 거부한다
 $ docker run --rm -e JWT_SECRET=short axum-demo:study

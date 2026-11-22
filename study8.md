@@ -71,14 +71,21 @@ tests/api.rs  ← lib을 외부 사용자처럼 가져다 쓴다
 ```rust
 pub fn app(state: AppState) -> Router {
     let upload_dir = state.upload_dir.as_str().to_string();
+    let cors = cors_layer(&state.cors_origin);                    // CORS_ORIGIN에서 온 출처 목록
+
+    // 스펙 v1: 업무 API는 모두 /api 아래. 호출 제한은 이 라우터에만 건다 (헬스 체크·정적 파일은 제외)
+    let api = Router::new()
+        .nest("/auth", auth::router())
+        .nest("/posts", posts::router())
+        .nest("/comments", comments::router())
+        .layer(axum::middleware::from_fn_with_state(state.clone(), ratelimit::rate_limit));
 
     Router::new()
-        .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", openapi::ApiDoc::openapi()))
+        .merge(SwaggerUi::new("/api-docs").url("/api-docs/openapi.json", openapi::ApiDoc::openapi()))
         .route("/", get(routes::root))
         .route("/health", get(routes::health))
         // ... 데모용 라우트
-        .nest("/posts", posts::router())
-        .nest("/auth", auth::router())
+        .nest("/api", api)
         .nest_service("/uploads", ServeDir::new(upload_dir))
         .fallback(handle_404)
         .method_not_allowed_fallback(handle_405)
@@ -93,7 +100,7 @@ pub fn app(state: AppState) -> Router {
                 .layer(axum::middleware::from_fn(middleware::error_envelope))                                   // 6
                 .layer(CatchPanicLayer::custom(middleware::on_panic))                                           // 7
                 .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, middleware::REQUEST_TIMEOUT))// 8
-                .layer(cors_layer())                                                                            // 9
+                .layer(cors)                                                                                    // 9
                 .layer(DefaultBodyLimit::max(middleware::BODY_LIMIT_BYTES)),                                    // 10
         )
 }
@@ -132,7 +139,11 @@ GET /slow   -> 408 | x-request-id=(없음)         ❌
 
 ```rust
 #[derive(Debug, Clone)]
-pub struct Config { pub database_url: String, pub jwt_secret: String, pub bind_addr: String, pub upload_dir: String }
+pub struct Config {
+    pub database_url: String, pub jwt_secret: String, pub bind_addr: String, pub upload_dir: String,
+    pub cors_origin: String,             // CORS_ORIGIN (쉼표로 여러 개)
+    pub rate_limit_per_minute: u32,      // RATE_LIMIT_PER_MINUTE (0이면 제한 없음)
+}
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
@@ -141,12 +152,14 @@ impl Config {
             jwt_secret:   env_or("JWT_SECRET", DEV_JWT_SECRET),
             bind_addr:    env_or("BIND_ADDR", "127.0.0.1:3000"),
             upload_dir:   env_or("UPLOAD_DIR", "uploads"),
+            cors_origin:  env_or("CORS_ORIGIN", DEFAULT_CORS_ORIGIN),
+            rate_limit_per_minute: env_or("RATE_LIMIT_PER_MINUTE", "300").parse().context("...")?,
         };
         config.validate()?;
         Ok(config)
     }
 
-    pub fn for_test() -> Self { /* in-memory DB, 고정 비밀키, 포트 0 */ }
+    pub fn for_test() -> Self { /* in-memory DB, 고정 비밀키, 포트 0, 호출 제한 0(끔) */ }
 
     fn validate(&self) -> anyhow::Result<()> {
         if self.jwt_secret.len() < 16 { anyhow::bail!("JWT_SECRET이 너무 짧습니다 (최소 16자)"); }
@@ -170,10 +183,13 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::init(&config.database_url).await?;
     upload::ensure_dir(&config.upload_dir).await?;
 
-    let state = AppState::new(pool, config.jwt_secret.clone(), config.upload_dir.clone());
+    let state = AppState::new(pool, config.jwt_secret.clone(), config.upload_dir.clone())
+        .with_cors_origin(config.cors_origin.clone())                      // 기본값을 쓰는 호출자(테스트)는 new만 쓰면 된다
+        .with_rate_limit_per_minute(config.rate_limit_per_minute);
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
 
-    axum::serve(listener, app(state))
+    // ConnectInfo를 켜야 호출 제한 미들웨어가 요청자 IP를 본다 (study6 3-8)
+    axum::serve(listener, app(state).into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())     // Ctrl+C/종료 신호를 받으면 진행 중 요청을 마치고 종료
         .await?;
     Ok(())
@@ -203,6 +219,8 @@ async fn main() -> anyhow::Result<()> {
 | `JWT_SECRET` | 개발용 기본값(경고 출력) | 길고 무작위. 기본값이면 경고, 짧으면 **부팅 거부** |
 | `BIND_ADDR` | `127.0.0.1:3000` (내 컴퓨터만) | `0.0.0.0:3000` (**127.0.0.1이면 컨테이너 밖에서 접속 불가**) |
 | `DATABASE_URL` | `sqlite://data.db?mode=rwc` | 볼륨 위 SQLite 또는 `postgres://…` |
+| `CORS_ORIGIN` | `http://localhost:5173` | 실제 프론트 주소 (쉼표로 여러 개). **`*`나 `permissive()`는 쓰지 않는다** |
+| `RATE_LIMIT_PER_MINUTE` | `300` | 서비스 성격에 맞게. 서버가 여러 대면 대수만큼 허용량이 늘어난다는 점에 주의 |
 | `RUST_LOG` | `demo=debug,tower_http=debug` | `demo=info,tower_http=info` |
 | 빌드 | `cargo run` (빠른 컴파일, 느린 실행) | `cargo build --release` (`lto="thin"`, `codegen-units=1`, `strip=true`) |
 | 쿠키 `Secure` | 끔 (http) | **켬** (https) |
@@ -258,7 +276,7 @@ async fn main() -> anyhow::Result<()> {
 
 ## ⑥ 직접 해보기
 
-1. **`CORS_ORIGIN` 환경변수화**: 코드에 고정된 `http://localhost:5173`을 `Config`로 옮기고 쉼표로 여러 출처를 받게 한다. `validate()`에서 **파싱 가능한 URL인지** 시작 시점에 검사한다 (study6 ④의 ❌ 항목 하나가 사라진다).
+1. **설정이 흐르는 길 따라가기**: `CORS_ORIGIN="https://a.example.com,https://b.example.com"`로 서버를 띄우고, 두 출처 각각과 `http://localhost:5173`으로 `curl -i -X OPTIONS .../health -H "Origin: …" -H "Access-Control-Request-Method: GET"`을 보내 어느 쪽에 `access-control-allow-origin`이 오는지 본다. 환경변수 → `Config` → `AppState` → `cors_layer` 순서로 코드를 따라가 값이 바뀌는 지점을 짚어 본다.
 2. **미들웨어 순서 실험**: `PropagateRequestIdLayer`를 일부러 맨 안쪽으로 옮기고 `/health`, `/panic`, `/slow`의 `x-request-id`를 `curl -i`로 비교한다. 다시 복구한다.
 3. **중복 찾기**: `demo/src/`에서 같은 모양의 코드가 두 번 이상 나오는 곳을 하나 찾아 함수로 추출하고 테스트가 그대로 통과하는지 확인한다.
 
@@ -273,6 +291,7 @@ async fn main() -> anyhow::Result<()> {
 - ☐ `.env`를 `tracing` 초기화보다 먼저 읽어야 하는 이유를 안다
 - ☐ `ServiceBuilder`에서 "위가 바깥"이라는 규칙과 일반 원칙(전체 적용은 바깥, 조건부는 안쪽)을 설명할 수 있다
 - ☐ 요청 ID가 패닉·타임아웃 응답에 빠지는 사례의 원인을 설명할 수 있다
+- ☐ 허용 출처·호출 제한 같은 값이 코드에 고정되지 않고 `Config` → `AppState`로 흐르는 것을 설명할 수 있다 (`new` + `with_*` 빌더로 기본값을 유지하는 이유 포함)
 - ☐ 개발/운영에서 달라지는 값(`BIND_ADDR`, `JWT_SECRET`, `RUST_LOG`, 빌드 프로필, `Secure` 쿠키)을 표 없이 말할 수 있다
 - ☐ `panic = "abort"`를 켜면 안 되는 이유를 설명할 수 있다
 

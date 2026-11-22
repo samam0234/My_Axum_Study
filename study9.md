@@ -5,7 +5,7 @@
 | 항목 | 내용 |
 |---|---|
 | 관련 코드 | 단위: [demo/src/pagination.rs](demo/src/pagination.rs) 하단, 요청 테스트: [demo/tests/api.rs](demo/tests/api.rs), mock: [lab/src/mock_demo.rs](lab/src/mock_demo.rs) |
-| 실행 결과 | `demo`: 단위 7 + 통합 15 통과(약 1.2초). `lab`: mock 테스트 3 + 서명 검증 3 + 프롬프트/스트림 3 통과 |
+| 실행 결과 | `demo`: 단위 12 + 통합 31 통과(약 1.6초). `lab`: mock 테스트 3 + 서명 검증 3 + 프롬프트/스트림 3 통과 |
 
 ---
 
@@ -36,7 +36,7 @@ Rust는 단위 테스트를 **테스트 대상과 같은 파일**에 둔다. `#[
 `Router`는 tower의 `Service`다. 소켓을 열지 않고 `router.oneshot(request)`로 요청을 **함수 호출처럼** 넣고 응답을 받는다.
 
 - 포트 충돌이 없어 **병렬 실행**이 된다.
-- 네트워크 왕복이 없어 빠르다 (통합 15개 + 단위 7개가 1.2초).
+- 네트워크 왕복이 없어 빠르다 (통합 31개 + 단위 12개가 1.6초).
 - 미들웨어 계층(요청 ID, 오류 재작성, 압축)까지 **전부 탄다.**
 - 매 테스트가 **새 in-memory DB**를 만들어 서로 격리된다.
 
@@ -61,7 +61,7 @@ Rust는 단위 테스트를 **테스트 대상과 같은 파일**에 둔다. `#[
 mod tests {
     use super::*;
 
-    fn query(page: u32, per_page: u32) -> PageQuery { PageQuery { page, per_page, q: None, tag: None } }
+    fn query(page: u32, limit: u32) -> PageQuery { PageQuery { page, limit, q: None, sort: None, tag: None } }
 
     #[test]
     fn offset은_페이지와_크기로_계산된다() {
@@ -72,9 +72,14 @@ mod tests {
 
     #[test]
     fn total_pages는_올림_계산이다() {
-        let page = Page::new(Vec::<i32>::new(), &query(1, 10), 25);   // 25건 / 10 → 3페이지
-        assert_eq!(page.total_pages, 3);
-        assert!(page.has_next);
+        let page = Paged::new(Vec::<i32>::new(), &query(1, 10), 25);   // 25건 / 10 → 3페이지
+        assert_eq!(page.meta.total_pages, 3);
+    }
+
+    #[test]
+    fn limit이_50을_넘으면_50으로_줄인다() {          // 스펙 §4: 오류가 아니라 보정
+        assert_eq!(query(1, 1000).effective_limit(), 50);
+        assert_eq!(query(2, 1000).offset(), 50);       // 줄인 값으로 offset도 계산
     }
 
     #[test]
@@ -82,7 +87,7 @@ mod tests {
         use validator::Validate;
         assert!(query(1, 10).validate().is_ok());
         assert!(query(0, 10).validate().is_err());     // page >= 1
-        assert!(query(1, 101).validate().is_err());    // per_page <= 100
+        assert!(query(1, 0).validate().is_err());      // limit >= 1
     }
 }
 ```
@@ -98,6 +103,9 @@ async fn test_app() -> Router {
     let pool = db::init(&config.database_url).await.expect("테스트 DB 초기화 실패");
     app(AppState::new(pool, config.jwt_secret, config.upload_dir))     // 운영과 같은 app()
 }
+
+/// 상태를 조금 바꿔서 앱을 만든다. (예: 호출 제한을 켠다) 기본 AppState::new는 제한 없음·기본 CORS 출처
+async fn test_app_with(tweak: impl FnOnce(AppState) -> AppState) -> Router { /* test_app과 같고 tweak(...)만 거친다 */ }
 
 async fn request(app: &Router, method: &str, uri: &str, body: Option<Value>, token: Option<&str>)
     -> (StatusCode, Value)
@@ -127,17 +135,25 @@ async fn request(app: &Router, method: &str, uri: &str, body: Option<Value>, tok
 | `.collect().await.to_bytes()` | 응답 본문은 스트림이다. `http_body_util::BodyExt`로 끝까지 모은다 |
 | `(StatusCode, Value)` 반환 | 대부분의 시험이 "상태 코드 + JSON 필드 몇 개"만 보면 되므로 헬퍼로 줄인다 |
 
-시험 목록 (한 줄이 한 가지 약속이다):
+시험 목록 31개 (한 줄이 한 가지 약속이다. **공통 API 스펙 v1의 각 항목이 시험 하나씩 대응한다**):
 
 ```
-health_체크는_200을_돌려준다                          없는_경로는_통일된_404_json을_돌려준다
-메서드가_다르면_405다                                 패닉해도_500_json이_나간다
-토큰_없이는_글을_쓸_수_없다                           게시글_crud_전체_흐름
-남의_글은_수정할_수_없다                              검증_실패는_400과_필드별_fields를_준다
-중복_가입은_409다                                    로그인_실패_메시지는_아이디_존재_여부를_알려주지_않는다
-페이지네이션이_동작한다                               sql_인젝션_시도는_그냥_검색어로_취급된다
-페이지_파라미터_범위를_벗어나면_400이다               응답_json은_camel_case다
-오류_본문의_request_id는_응답_헤더와_같다
+[공통]   health_체크는_접두어_없이_200을_돌려준다          없는_경로는_통일된_404_json을_돌려준다
+         접두어_없는_옛_경로는_더_이상_없다               메서드가_다르면_405다
+         패닉해도_500_json이_나간다                      오류_본문의_request_id는_응답_헤더와_같다
+[인증]   가입_응답은_data로_감싸고_비밀번호가_없다          로그인_응답은_data_user_access_token이다
+         me는_data로_내_정보를_준다                      로그아웃은_인증이_필요하고_204다
+         중복_이메일은_409_email_taken이다               중복_닉네임은_이메일_중복과_구분되는_409다
+         가입_검증_실패는_fields에_필드별_메시지를_준다     로그인_실패_메시지는_이메일_존재_여부를_알려주지_않는다
+[글]     토큰_없이는_글을_쓸_수_없다                      게시글_crud_전체_흐름 (201 + Location, 204 본문 없음)
+         남의_글은_수정할_수_없다                         글_검증_실패는_400과_필드별_fields를_준다
+         숫자가_아닌_id는_400_bad_request다               목록은_data와_meta를_준다
+         검색어는_meta_q로_돌아오고_대소문자를_무시한다     limit이_50을_넘으면_오류가_아니라_50으로_줄인다
+         잘못된_page_limit_sort는_400이다                 sort로_오래된_순과_댓글_많은_순을_고를_수_있다
+         sql_인젝션_시도는_그냥_검색어로_취급된다           응답_json은_camel_case다
+[댓글]   댓글_작성_목록_삭제_흐름                         없는_글의_댓글은_404고_빈_본문은_400이다
+         글을_지우면_댓글도_함께_사라진다
+[운영]   호출_제한을_넘으면_429_rate_limited와_retry_after를_준다     cors_출처는_설정값을_따른다
 ```
 
 시험 하나의 모양:
@@ -149,11 +165,9 @@ async fn 남의_글은_수정할_수_없다() {
     let alice = signup_and_login(&app, "alice").await;
     let bob = signup_and_login(&app, "bob").await;
 
-    let (_, created) = request(&app, "POST", "/posts",
-        Some(json!({ "title": "앨리스의 글", "content": "본문" })), Some(&alice)).await;
-    let id = created["id"].as_i64().unwrap();
+    let id = create_post(&app, &alice, "앨리스의 글", "본문").await;     // POST /api/posts → data.id
 
-    let (status, body) = request(&app, "PATCH", &format!("/posts/{id}"),
+    let (status, body) = request(&app, "PATCH", &format!("/api/posts/{id}"),
         Some(json!({ "title": "탈취 시도" })), Some(&bob)).await;
 
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -165,8 +179,8 @@ async fn 남의_글은_수정할_수_없다() {
 
 ```
 $ cargo test
-running 7 tests ... test result: ok. 7 passed
-running 15 tests ... test result: ok. 15 passed; 0 failed; finished in 1.23s
+running 12 tests ... test result: ok. 12 passed
+running 31 tests ... test result: ok. 31 passed; 0 failed; finished in 1.58s
 ```
 
 ### 3-3. DB·외부 API를 가짜로 — [lab/src/mock_demo.rs](lab/src/mock_demo.rs)
@@ -322,7 +336,7 @@ CI(study16)에서는 `cargo test`가 **서버·네트워크 없이** 돌아야 �
 
 ## ⑥ 직접 해보기
 
-1. **시험 먼저 쓰기**: `GET /posts?page=0`이 400 `VALIDATION_ERROR`와 `fields.page`를 주는 시험을 **먼저** 쓰고 실패(빨강)를 확인한 뒤, 통과(초록)하는지 본다. 이미 통과한다면 왜 통과하는지 `PageQuery`의 `validate`에서 찾는다.
+1. **시험 먼저 쓰기**: `GET /api/posts?page=0`이 400 `VALIDATION_ERROR`와 `fields.page`를 주는 시험을 **먼저** 쓰고 실패(빨강)를 확인한 뒤, 통과(초록)하는지 본다. 이미 통과한다면 왜 통과하는지 `PageQuery`의 `validate`에서 찾는다.
 2. **`FakeNotifier` 활용**: `lab/src/mock_demo.rs`에 "알림 메시지에 수량이 0이면 안 나간다" 같은 규칙을 하나 추가하고, `fail: true`와 정상 두 경로를 시험한다.
 3. **`RUST_LOG=axum::rejection=trace`**: 서버를 띄우고 잘못된 JSON을 보내 거절 이유가 로그에 찍히는 것을 확인한다. 같은 요청이 응답에서는 어떻게 보이는지 비교한다.
 
@@ -332,7 +346,8 @@ CI(study16)에서는 `cargo test`가 **서버·네트워크 없이** 돌아야 �
 
 - ☐ 단위 테스트(같은 파일)와 통합 테스트(`tests/`)의 차이를 설명할 수 있다
 - ☐ `oneshot`이 서버 없이 라우터를 호출한다는 것과 그 장점(병렬·빠름·미들웨어 포함)을 안다
-- ☐ `cargo test`를 실행해 `demo` 22개(단위 7 + 통합 15)가 통과하는 것을 확인했다
+- ☐ `cargo test`를 실행해 `demo` 43개(단위 12 + 통합 31)가 통과하는 것을 확인했다
+- ☐ 호출 제한·CORS처럼 **설정에 따라 달라지는 동작**은 `test_app_with(|s| s.with_…)`로 상태를 바꿔 시험한다는 것을 안다
 - ☐ 시험마다 새 in-memory DB를 쓰는 이유(격리)를 설명할 수 있다
 - ☐ `RUST_LOG`, `--nocapture`, `RUST_BACKTRACE`, `#[axum::debug_handler]`를 상황에 맞게 고를 수 있다
 - ☐ 로그 한 줄에서 시각·레벨·모듈·필드를 읽을 수 있고, 500의 원인은 서버 로그에 있다는 것을 안다

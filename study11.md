@@ -140,7 +140,7 @@ PostgreSQL은 `$1, $2 …`만 받는다. **SQLite도 `$1`을 받는다** (실측
 | FK 인덱스 | 자동 아님 | **자동 아님** | `CREATE INDEX ... (author_id)` 명시 |
 | 연결 | 파일 락·WAL | 풀 + 서버 | `db.rs`만 다름 |
 
-PostgreSQL 마이그레이션 ([demo/migrations_pg/0001_create_posts.sql](demo/migrations_pg/0001_create_posts.sql)):
+PostgreSQL 마이그레이션 ([demo/migrations_pg/0001_create_posts.sql](demo/migrations_pg/0001_create_posts.sql), 이후 0002~0003과 스펙 v1용 [0004_spec_v1.sql](demo/migrations_pg/0004_spec_v1.sql)이 SQLite와 같은 순서·같은 의미로 이어진다):
 
 ```sql
 CREATE TABLE IF NOT EXISTS posts (
@@ -168,19 +168,23 @@ cargo run --no-default-features --features postgres
 
 [demo/compose.postgres.yaml](demo/compose.postgres.yaml)의 핵심은 `healthcheck: pg_isready` (DB가 **준비된 뒤에** 앱을 붙이기 위해)와 `"${PG_PORT:-5432}:5432"`(포트 충돌 회피)다.
 
-실측 (PostgreSQL 17, 같은 `curl` 시나리오):
+실측 (PostgreSQL 17, 같은 `curl` 시나리오 — 스펙 v1 API 기준):
 
 ```
 {"status":"ok"}
-{"id":1,"username":"alice","email":"alice@example.com","createdAt":"2026-11-22T15:12:17.395524Z"}      ← 마이크로초 정밀도
-{"error":{"code":"EMAIL_TAKEN",...}}                                                                  ← UNIQUE 위반 → 409 (is_unique_violation은 DB 종류와 무관)
-201 Created  location: /posts/1
-GET /posts?q=hello&tag=RUST → total 1                                                                  ← 대소문자 무시 검색
-PATCH → 200 (updatedAt 갱신)          POST {"title":"",...} → 400 VALIDATION_ERROR + fields           DELETE → 204
+{"data":{"id":1,"email":"alice@example.com","nickname":"alice","createdAt":"2026-11-22T18:28:54.140988Z"}}      ← 마이크로초 정밀도
+{"error":{"code":"EMAIL_TAKEN",...}}                                                                          ← UNIQUE 위반 → 409 (is_unique_violation은 DB 종류와 무관)
+{"error":{"code":"CONFLICT","message":"이미 사용 중인 닉네임입니다",...}}                                          ← 닉네임 중복은 다른 코드 (오류 메시지에 든 제약 이름으로 가린다)
+201 Created  location: /api/posts/1
+GET /api/posts?q=HELLO&tag=RUST → total 1, commentCount 1                                                      ← 대소문자 무시 검색 + 댓글 수 서브쿼리
+PATCH → 200 (updatedAt 갱신)     POST {"title":"","body":""} → 400 VALIDATION_ERROR + fields     DELETE → 204
 
-public | _sqlx_migrations | table      ← 1, 2, 3 모두 success = t
-public | posts | table     public | users | table
+ version | success                         ← 마이그레이션 1~4가 모두 success = t (0004: 컬럼 이름 변경 + comments)
+ public | _sqlx_migrations | comments | posts | users
+ comments_left = 0                         ← 글을 지우면 FK ON DELETE CASCADE로 댓글도 사라졌다 (PostgreSQL에서도)
 ```
+
+같은 시나리오에서 `?sort=-commentCount&limit=999`는 `limit`이 50으로 보정되고 댓글 많은 글 순으로 나왔다. SQLite에서만 통하던 가정(대소문자 무시, 정수 비교 등)이 하나도 없다는 것을 시험 코드가 아니라 **실제 서버**로 확인한 것이다.
 
 ### 3-2. PostgreSQL · MariaDB — `project/` (SeaORM)
 

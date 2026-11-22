@@ -5,7 +5,7 @@
 | 항목 | 내용 |
 |---|---|
 | 관련 코드 | [demo/src/auth/](demo/src/auth/) (`password.rs`, `jwt.rs`, `extractor.rs`, `handler.rs`), [demo/src/posts/handler.rs](demo/src/posts/handler.rs) (`ensure_owner`), 쿠키 방식: [project/crates/web/src/auth.rs](project/crates/web/src/auth.rs) |
-| 검증 | `demo/tests/api.rs`의 인증·인가 테스트 (토큰 없이 쓰기 401, 남의 글 수정 403, 로그인 실패 메시지 동일) |
+| 검증 | `demo/tests/api.rs`의 인증·인가 테스트 (토큰 없이 쓰기 401, 남의 글 수정 403, 로그인 실패 메시지 동일, 로그아웃 204, 이메일 대소문자 무시) |
 | 버전 주의 | **jsonwebtoken 11** (`rust_crypto` feature 필수), **argon2 0.6** (API 변경) |
 
 ---
@@ -51,7 +51,7 @@ DB가 유출돼도 비밀번호가 새지 않게 하려면 **되돌릴 수 없�
 | 즉시 로그아웃/차단 | 쉽다 (세션 삭제) | **어렵다** — 만료 시각까지 유효 |
 | 서버 여러 대 | 세션 공유 저장소 필요 | 키만 같으면 된다 |
 
-JWT = `헤더.페이로드.서명`. 페이로드(`sub`, `username`, `iat`, `exp`)는 **암호화가 아니라 base64**라서 누구나 읽을 수 있다 → **비밀을 넣지 않는다.** 서명이 맞아야만 유효하다.
+JWT = `헤더.페이로드.서명`. 페이로드(`sub`, `nickname`, `iat`, `exp`)는 **암호화가 아니라 base64**라서 누구나 읽을 수 있다 → **비밀을 넣지 않는다.** 서명이 맞아야만 유효하다.
 
 ### CORS · XSS · CSRF — 서로 다른 세 가지
 
@@ -106,14 +106,14 @@ pub const TOKEN_TTL_SECONDS: i64 = 60 * 60; // 1시간 (공통 API 스펙 v1 §6
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: i64,          // subject — 사용자 id (JWT 표준 이름)
-    pub username: String,  // 커스텀 클레임
+    pub nickname: String,  // 커스텀 클레임
     pub iat: i64,          // issued at
     pub exp: i64,          // expiration — 라이브러리가 만료 검사를 자동으로 해 준다
 }
 
-pub fn encode_token(secret: &str, user_id: i64, username: &str) -> anyhow::Result<String> {
+pub fn encode_token(secret: &str, user_id: i64, nickname: &str) -> anyhow::Result<String> {
     let now = chrono::Utc::now().timestamp();
-    let claims = Claims { sub: user_id, username: username.to_string(), iat: now, exp: now + TOKEN_TTL_SECONDS };
+    let claims = Claims { sub: user_id, nickname: nickname.to_string(), iat: now, exp: now + TOKEN_TTL_SECONDS };
     Ok(encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret.as_bytes()))?)
 }
 
@@ -130,7 +130,7 @@ pub fn decode_token(secret: &str, token: &str) -> Result<Claims, jsonwebtoken::e
 
 ```rust
 #[derive(Debug, Clone)]
-pub struct AuthUser { pub id: i64, pub username: String }
+pub struct AuthUser { pub id: i64, pub nickname: String }
 
 impl<S> FromRequestParts<S> for AuthUser
 where
@@ -153,7 +153,7 @@ where
             }
         })?;
 
-        Ok(AuthUser { id: claims.sub, username: claims.username })
+        Ok(AuthUser { id: claims.sub, nickname: claims.nickname })
     }
 }
 ```
@@ -179,31 +179,43 @@ async fn create(State(state): State<AppState>, auth: AuthUser,   // 인증 필�
 ### 3-4. 회원가입·로그인 — [demo/src/auth/handler.rs](demo/src/auth/handler.rs)
 
 ```rust
+/// POST /api/auth/login — 이메일로 로그인한다. (스펙 v1: { email, password })
 pub async fn login(State(state): State<AppState>, ValidatedJson(body): ValidatedJson<LoginRequest>)
-    -> AppResult<Json<TokenResponse>>
+    -> AppResult<Json<Data<LoginData>>>
 {
-    let row = repo::find_by_username(&state.db, &body.username).await?;
+    let row = repo::find_by_email(&state.db, &normalize_email(&body.email)).await?;   // 이메일은 소문자로 맞춰 저장·조회
 
-    // ⚠️ "없는 아이디"와 "틀린 비밀번호"를 구분해서 알려 주면 안 된다 (user enumeration)
+    // ⚠️ "없는 이메일"과 "틀린 비밀번호"를 구분해서 알려 주면 안 된다 (user enumeration)
     let Some(user) = row else { return Err(AppError::InvalidCredentials); };
 
     if !password::verify(body.password, user.password_hash.clone()).await? {
         return Err(AppError::InvalidCredentials);
     }
 
-    let token = jwt::encode_token(&state.jwt_secret, user.id, &user.username)?;
-    Ok(Json(TokenResponse { access_token: token, token_type: "Bearer", expires_in: jwt::TOKEN_TTL_SECONDS, user: UserPublic::from(user) }))
+    let token = jwt::encode_token(&state.jwt_secret, user.id, &user.nickname)?;
+    Ok(Json(Data::new(LoginData { user: UserPublic::from(user), access_token: token })))   // { data: { user, accessToken } }
 }
+
+/// POST /api/auth/logout — 인증이 필요하고 204. Bearer 토큰은 서버가 기억하지 않으니 지울 것이 없다.
+pub async fn logout(_auth: AuthUser) -> StatusCode { StatusCode::NO_CONTENT }
 
 fn map_unique_violation(err: sqlx::Error) -> AppError {
     if let sqlx::Error::Database(ref db_err) = err {
-        if db_err.is_unique_violation() { return AppError::EmailTaken; }     // 409
+        if db_err.is_unique_violation() {
+            let message = db_err.message();
+            // 이메일·닉네임 둘 다 UNIQUE라서 어느 쪽이 걸렸는지 오류 메시지에서 가린다
+            if message.contains("nickname") || message.contains("username") {
+                return AppError::Conflict("이미 사용 중인 닉네임입니다".into());    // 409 CONFLICT
+            }
+            return AppError::EmailTaken;                                          // 409 EMAIL_TAKEN
+        }
     }
     AppError::Database(err)
 }
 ```
 
-- **로그인 실패 응답이 두 경우에서 완전히 같다** (`INVALID_CREDENTIALS`, 같은 문구). 다르면 공격자가 "가입된 아이디 목록"을 수집한다. 테스트가 이것을 지킨다: `로그인_실패_메시지는_아이디_존재_여부를_알려주지_않는다`.
+- **로그인 실패 응답이 두 경우에서 완전히 같다** (`INVALID_CREDENTIALS`, 같은 문구). 다르면 공격자가 "가입된 이메일 목록"을 수집한다. 테스트가 이것을 지킨다: `로그인_실패_메시지는_이메일_존재_여부를_알려주지_않는다`.
+- 이메일은 **소문자로 맞춰 저장하고 조회**한다(`Mina@Example.com`으로 가입해도 `mina@example.com`으로 로그인된다). 이메일 대소문자 때문에 같은 사람이 두 계정을 만드는 일을 막는다.
 - 회원가입의 **중복 확인은 `SELECT` 후 `INSERT`가 아니라 `UNIQUE` 제약 + 위반 변환**으로 한다. 먼저 조회하는 방식은 동시 요청 사이에 끼어들 틈이 있다(경합).
 - `UserPublic`에는 **`password_hash` 필드가 없다.** 응답에 실수로 섞여 나갈 일이 구조적으로 없다.
 - 가입은 평문 비밀번호가 **한 번도 로그에 찍히지 않게** 주의한다(`#[derive(Debug)]`한 요청 타입을 `tracing::debug!(?body)`로 찍으면 비밀번호가 로그에 남는다).
@@ -222,32 +234,44 @@ async fn ensure_owner(state: &AppState, post_id: i64, auth: &AuthUser) -> AppRes
 }
 ```
 
-`update`/`delete`/`upload_thumbnail`이 모두 첫 줄에서 `ensure_owner`를 부른다. 그리고 **작성자는 요청 본문에서 받지 않고** `auth.username`/`auth.id`(토큰)에서만 가져온다 — 클라이언트가 `author: "남의이름"`을 보내도 `deny_unknown_fields`로 거절된다.
+`update`/`delete`/`upload_thumbnail`이 모두 첫 줄에서 `ensure_owner`를 부른다. 그리고 **작성자는 요청 본문에서 받지 않고** `auth.nickname`/`auth.id`(토큰)에서만 가져온다 — 클라이언트가 `author: "남의이름"`을 보내도 `deny_unknown_fields`로 거절된다.
 
 ### 3-6. CORS 설정 — [demo/src/lib.rs](demo/src/lib.rs)
 
 ```rust
-fn cors_layer() -> CorsLayer {
+fn cors_layer(origins: &str) -> CorsLayer {
+    let origins: Vec<HeaderValue> = origins.split(',').map(str::trim).filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok()).collect();                               // CORS_ORIGIN: 쉼표로 여러 개
+
     CorsLayer::new()
-        .allow_origin("http://localhost:5173".parse::<HeaderValue>().unwrap())   // 출처를 명시
+        .allow_origin(origins)                                                   // 출처를 명시
         .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
         .max_age(Duration::from_secs(3600))                                      // preflight 결과를 1시간 캐시
 }
 ```
 
-`CorsLayer::permissive()`는 편하지만 **운영에서 쓰지 않는다.** 허용 출처는 환경변수(`CORS_ORIGIN`)로 빼는 것이 공통 API 스펙 v1의 요구인데, 현재 `demo/`는 코드에 고정되어 있다 (study6 ④ 표의 ❌ 항목).
+`CorsLayer::permissive()`는 편하지만 **운영에서 쓰지 않는다.** 허용 출처는 환경변수 `CORS_ORIGIN`(쉼표로 여러 개, 기본 `http://localhost:5173`)에서 읽는다 — 공통 API 스펙 v1 §7의 요구이고 `Config::from_env`가 시작할 때 헤더로 쓸 수 없는 값을 거절한다. `CORS_ORIGIN=https://front.example.com`으로 띄워 그 출처만 `access-control-allow-origin`을 받고 `http://localhost:5173`은 받지 않는 것을 확인했다 (study6 3-10).
 
 ### 3-7. 실행 확인
 
 ```
-$ curl -X POST .../posts -d '{"title":"무단","content":"본문"}'                    # 토큰 없음
-{"error":{"code":"UNAUTHORIZED","message":"Authorization 헤더에 Bearer 토큰이 필요합니다", ...}}   → 401
+$ curl -X POST .../api/posts -d '{"title":"x","body":"y"}'                     # 토큰 없음
+{"error":{"code":"UNAUTHORIZED","message":"Authorization 헤더에 Bearer 토큰이 필요합니다","requestId":"5699cde3-..."}}   → 401
 
-alice가 쓴 글을 bob의 토큰으로 PATCH
-{"error":{"code":"FORBIDDEN","message":"본인이 작성한 글만 수정/삭제할 수 있습니다", ...}}        → 403
+$ curl -X PATCH .../api/posts/1 -H "authorization: Bearer $BOB" -d '{"title":"hijack"}'   # alice가 쓴 글
+{"error":{"code":"FORBIDDEN","message":"본인이 작성한 글만 수정/삭제할 수 있습니다","requestId":"ec0899eb-..."}}        → 403
 
-없는 아이디 / 틀린 비밀번호로 로그인  →  둘 다 401 {"code":"INVALID_CREDENTIALS", 같은 message}
+$ curl -X POST .../api/auth/login -d '{"email":"alice@example.com","password":"wrongwrong"}'   # 틀린 비밀번호
+$ curl -X POST .../api/auth/login -d '{"email":"nobody@example.com","password":"wrongwrong"}'  # 없는 이메일
+{"error":{"code":"INVALID_CREDENTIALS","message":"이메일 또는 비밀번호가 올바르지 않습니다","requestId":"..."}}   → 둘 다 401, message 동일
+
+$ 토큰 가운데 부분을 base64 디코드
+{'sub': 1, 'nickname': 'alice', 'iat': 1795371872, 'exp': 1795375472}        ← 암호화가 아니라서 그대로 읽힌다 (exp - iat = 3600)
+
+$ curl .../api/auth/me -H "authorization: Bearer $TOKEN"
+{"data":{"id":1,"email":"alice@example.com","nickname":"alice","createdAt":"2026-11-22T18:24:31.885385500Z"}}
+$ curl -X POST .../api/auth/logout -H "authorization: Bearer $TOKEN"                                  → 204
 ```
 
 ---
@@ -257,8 +281,8 @@ alice가 쓴 글을 bob의 토큰으로 PATCH
 ### 방식 A. Bearer 토큰 (이 `demo/`의 방식)
 
 ```
-로그인:  POST /auth/login → { "accessToken": "eyJ..." }
-이후:    fetch("/posts", { headers: { Authorization: `Bearer ${token}` } })
+로그인:  POST /api/auth/login → { "data": { "user": {...}, "accessToken": "eyJ..." } }
+이후:    fetch("/api/posts", { headers: { Authorization: `Bearer ${token}` } })
 ```
 
 - 토큰을 **프론트가 직접 들고 있다가 헤더로 실어 보낸다.**
@@ -299,9 +323,10 @@ pub fn session_cookie(token: &str, secure: bool) -> String {
 | 응답 | 프론트 동작 |
 |---|---|
 | 401 `UNAUTHORIZED` | 로그인 화면으로 보내고, 원래 가려던 주소를 기억 |
-| 401 `INVALID_CREDENTIALS` | 로그인 폼에 "아이디 또는 비밀번호를 확인하세요" |
+| 401 `INVALID_CREDENTIALS` | 로그인 폼에 "이메일 또는 비밀번호를 확인하세요" |
 | 403 `FORBIDDEN` | "권한이 없습니다" (로그인은 되어 있음 → 로그인 화면으로 보내지 않는다) |
-| 409 `EMAIL_TAKEN` | 가입 폼의 이메일 칸에 오류 표시 |
+| 409 `EMAIL_TAKEN` | 가입 폼의 이메일 칸에 오류 표시 (닉네임 중복은 `CONFLICT` — 닉네임 칸에) |
+| 429 `RATE_LIMITED` | `Retry-After` 초만큼 기다렸다가 다시 시도하라고 안내 (study6 3-8) |
 
 ---
 
@@ -326,7 +351,7 @@ pub fn session_cookie(token: &str, secure: bool) -> String {
 
 ## ⑥ 직접 해보기
 
-1. **토큰 직접 열어 보기**: 로그인으로 받은 `accessToken`을 `.`로 나눠 가운데 부분을 base64 디코드하면 `sub`, `username`, `exp`가 그대로 보인다. 왜 비밀을 넣으면 안 되는지 확인한다.
+1. **토큰 직접 열어 보기**: 로그인으로 받은 `data.accessToken`을 `.`로 나눠 가운데 부분을 base64 디코드하면 `sub`, `nickname`, `exp`가 그대로 보인다. 왜 비밀을 넣으면 안 되는지 확인한다.
 2. **만료 실험**: `TOKEN_TTL_SECONDS`를 5초로 줄이고 로그인 → 6초 뒤 글쓰기를 호출해 `토큰이 만료되었습니다` 문구를 본다. 원래 값(3600)으로 되돌린다.
 3. **CSRF 직접 보기**: [study12](study12.md)의 `s12_front`로 쿠키를 발급받은 뒤, 다른 출처의 HTML에서 `<form method="POST" action="http://127.0.0.1:3012/api/logout">`을 제출하면 `SameSite=Lax` 때문에 쿠키가 실리는지 개발자도구 Network 탭에서 확인한다. `SameSite=None`으로 바꿨을 때와 비교한다.
 
@@ -344,6 +369,7 @@ pub fn session_cookie(token: &str, secure: bool) -> String {
 - ☐ CORS / XSS / CSRF가 각각 무엇을 막는지 한 문장씩 말할 수 있다
 - ☐ Bearer 방식과 HttpOnly 쿠키 방식의 장단점, `HttpOnly`/`SameSite`/`Secure`의 의미를 안다
 - ☐ `jsonwebtoken`에 `rust_crypto` feature가 필요한 이유와 증상을 기억한다
+- ☐ Bearer 방식의 로그아웃이 서버에서 하는 일이 없는 이유(204만 준다)와 즉시 무효화가 필요할 때의 대안을 말할 수 있다
 
 ---
 
