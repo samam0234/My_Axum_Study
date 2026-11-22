@@ -23,3 +23,7 @@
 # editor
 .vscode/*
 !.vscode/extensions.json
+
+# lab 예제가 실행 중에 만드는 파일
+**/todos.json
+**/todos.json.tmp
