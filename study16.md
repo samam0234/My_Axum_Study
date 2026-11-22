@@ -6,7 +6,7 @@
 |---|---|
 | 관련 파일 | [.github/workflows/ci.yml](.github/workflows/ci.yml), [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml), [demo/Dockerfile](demo/Dockerfile), [demo/compose.yaml](demo/compose.yaml), [demo/compose.postgres.yaml](demo/compose.postgres.yaml) |
 | 로컬 검증 | 워크플로 YAML 문법 검증 + **워크플로가 실행하는 것과 같은 명령**(`cargo test`, `cargo check --no-default-features --features postgres`, `cargo test --workspace`, `cargo test --lib --examples`)을 로컬에서 실행해 통과 확인 · 백업/복원 실측(PostgreSQL, SQLite) |
-| GitHub에서의 실제 실행 | 푸시 후 Actions 결과로 확인한다 (아래 ③-3 끝의 "실행 결과"에 기록) |
+| GitHub에서의 실제 실행 | `ci.yml` 첫 실행 **3 job 모두 성공** (아래 ③-4). `docker-publish.yml`은 태그 푸시 때만 돌아서 아직 미실행 |
 
 ---
 
@@ -211,7 +211,18 @@ lab      $ cargo test --lib --examples                                     → m
 워크플로 YAML                                                               → 문법 검증 통과 (jobs: demo, project, lab / publish)
 ```
 
-**GitHub Actions 실제 실행 결과**: (푸시 후 기록)
+**GitHub Actions 실제 실행 결과** (커밋 `50acec1` 푸시 직후, `ci` 워크플로 첫 실행): 세 job 모두 **success**.
+
+```
+ci  completed success
+  demo     (sqlite 테스트 + postgres 빌드)   success     ← Ubuntu에서 cargo test + PostgreSQL feature 컴파일
+  project  (워크스페이스 테스트)              success     ← 도메인 서비스 시험 5 + 유틸 1
+  lab      (예제 컴파일 + 테스트)             success     ← mongodb·reqwest·ws 포함 전 예제 컴파일, 단위 테스트 9
+```
+
+로컬(Windows)에서 통과한 것이 CI(Ubuntu)에서도 통과했다 — 경로 구분자·줄바꿈·설치된 도구에 의존하는 시험이 없다는 확인이기도 하다.
+
+`docker-publish.yml`은 **`v*` 태그를 푸시할 때만** 실행되므로 아직 실행하지 않았다. 실행하면 이미지가 GHCR에 게시(공개 범위는 저장소 설정을 따른다)되므로, 첫 릴리스는 의도를 가지고 태그를 붙여 확인한다. (YAML 문법과 matrix 구성은 로컬에서 검증했다.)
 
 ### 3-5. 로그 · 모니터링 체크리스트
 
