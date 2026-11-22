@@ -1,431 +1,277 @@
-# 오류 타입으로 응답 통일하기 (Study 4)
+# study4 — 라우팅과 요청 처리
 
-[study3.md](study3.md)에서 본문 관련 오류는 JSON으로 통일했지만, 아직 이런 상태입니다.
+> 🎯 **목표**: URL이 핸들러까지 가는 길(정적/동적/와일드카드 경로, 쿼리, 리다이렉트)을 이해하고, 요청이 들어와 응답이 나가는 **전체 흐름**과 404/405 오류 응답을 직접 제어한다. 프론트와 백엔드의 경로·출처(CORS)를 맞추는 방법까지 익힌다.
 
-```
-GET /posts/999  → 404 | {"error":"not_found","message":"post 999 not found"}   ← 내가 만든 것
-GET /posts/abc  → 400 | Invalid URL: Cannot parse `abc` to a `i64`             ← 평문
-GET /nope       → 404 | (본문이 아예 없음)
-DELETE /health  → 405 | (본문이 아예 없음)
-```
-
-클라이언트 입장에서 **"오류가 나면 `error`와 `message` 필드가 있는 JSON이 온다"** 고 믿을 수 없습니다. 이 문서에서 그걸 보장합니다.
-
-**이 문서에서 만드는 것**: `AppError` 단일 오류 타입 + 모든 extractor 실패·404·405·500까지 하나의 형식으로 통일
-
----
-
-## 1. 목표 — 오류 응답 계약 정하기
-
-먼저 "모든 오류는 이 모양이다"를 정합니다.
-
-```json
-{
-  "error": "not_found",                       // 기계가 읽는 코드 (분기용)
-  "message": "post 999 not found",            // 사람이 읽는 설명
-  "details": { "title": ["제목은 1~100자..."] }  // 선택 — 검증 실패일 때만
-}
-```
-
-| 필드 | 역할 | 왜 필요한가 |
-|---|---|---|
-| `error` | 안정적인 에러 코드 | 메시지 문구가 바뀌어도 클라이언트 분기 코드가 안 깨짐 |
-| `message` | 사람이 읽는 설명 | 디버깅·토스트 메시지 |
-| `details` | 필드별 상세 | 폼 검증 UI에서 필드 아래에 표시 |
-
----
-
-## 2. `thiserror`로 에러 타입 정의하기
-
-```powershell
-cargo add thiserror anyhow
-```
-
-두 크레이트의 역할이 다릅니다. 이건 Rust 에러 처리에서 가장 자주 헷갈리는 부분입니다.
-
-| 크레이트 | 용도 | 성격 |
-|---|---|---|
-| **`thiserror`** | **구체적인 에러 타입을 정의**할 때. `enum`에 `Display`/`Error` 구현을 자동 생성 | 호출자가 **경우를 구분해서 처리**해야 하는 에러 |
-| **`anyhow`** | **에러를 뭉뚱그려 전파**할 때. "뭐가 됐든 실패했다" | 호출자가 **구분할 필요 없는** 에러 (보통 500) |
-
-우리 `AppError`는 `thiserror`로 만들고, "예상 못 한 내부 오류" 변형 하나만 `anyhow::Error`를 담습니다.
-
-### `src/error.rs`
-
-```rust
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum AppError {
-    /// 리소스를 찾지 못함 → 404
-    #[error("{resource} {id} not found")]
-    NotFound { resource: &'static str, id: String },
-
-    /// 요청 자체가 잘못됨(경로/쿼리 파싱 실패 등) → 400
-    #[error("{0}")]
-    BadRequest(String),
-
-    /// 본문 파싱 실패 → axum이 판단한 상태 코드를 그대로 사용 (400 / 415 / 422)
-    #[error("{message}")]
-    InvalidBody { status: StatusCode, message: String },
-
-    /// 값 검증 실패 → 422
-    #[error("validation failed")]
-    Validation(validator::ValidationErrors),
-
-    /// 인증 실패 → 401 (study6)
-    #[error("{0}")]
-    Unauthorized(String),
-
-    /// 권한 없음 → 403 (study7)
-    #[error("{0}")]
-    Forbidden(String),
-
-    /// 중복 등 상태 충돌 → 409 (study6)
-    #[error("{0}")]
-    Conflict(String),
-
-    /// 예상하지 못한 내부 오류 → 500
-    #[error(transparent)]
-    Internal(#[from] anyhow::Error),
-}
-```
-
-### `thiserror`의 어트리뷰트 읽는 법
-
-| 어트리뷰트 | 의미 |
+| 항목 | 내용 |
 |---|---|
-| `#[error("...")]` | 이 변형의 `Display` 출력 형식. `{0}`은 튜플 필드, `{name}`은 이름 있는 필드 |
-| `#[error(transparent)]` | 감싼 에러의 메시지를 **그대로** 쓴다 (껍데기를 씌우지 않음) |
-| `#[from]` | **`From` 구현을 자동 생성** → `?`가 이 타입을 자동으로 변환해 준다 |
-| `#[source]` | 원인 에러 체인 연결 (`{:?}`에 함께 출력됨) |
-
-`#[from] anyhow::Error` 한 줄이 하는 일이 큽니다. 덕분에 이런 코드가 그냥 됩니다.
-
-```rust
-async fn boom() -> AppResult<&'static str> {
-    let _n: i32 = "not-a-number".parse()
-        .map_err(|e: std::num::ParseIntError| anyhow::anyhow!("설정 값 파싱 실패: {e}"))?;
-    //                                                                              ↑
-    //                              anyhow::Error → AppError::Internal 자동 변환
-    Ok("unreachable")
-}
-```
-
-### 왜 `enum`인가
-
-`match`로 분기할 때 **컴파일러가 빠뜨린 경우를 잡아줍니다.**
-
-```rust
-fn status(&self) -> StatusCode {
-    match self {
-        Self::NotFound { .. } => StatusCode::NOT_FOUND,
-        Self::BadRequest(_) => StatusCode::BAD_REQUEST,
-        // ... 하나라도 빠지면 컴파일 에러: "non-exhaustive patterns"
-    }
-}
-```
-
-나중에 `AppError::RateLimited`를 추가하면, **상태 코드 매핑을 빠뜨린 모든 자리가 컴파일 에러로 표시**됩니다. 런타임에 "어? 이 에러는 500으로 나가네?" 하고 발견하는 일이 없습니다. — Nest/Spring의 전역 예외 필터가 절대 줄 수 없는 안전망입니다.
+| 관련 코드 | [lab/examples/s04_routing.rs](lab/examples/s04_routing.rs) (포트 3004), 실제 적용은 [demo/src/lib.rs](demo/src/lib.rs) |
 
 ---
 
-## 3. `IntoResponse` 구현 — 하나의 출구
+## ① 목표
 
-```rust
-#[derive(Debug, Serialize)]
-struct ErrorBody {
-    error: &'static str,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]   // None이면 키 자체를 뺀다
-    details: Option<HashMap<String, Vec<String>>>,
-}
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        let status = self.status();
-        let code = self.code();
-
-        let details = match &self {
-            Self::Validation(errors) => Some(flatten_validation_errors(errors)),
-            _ => None,
-        };
-
-        let message = match &self {
-            // 500은 내부 사정을 밖으로 흘리지 않는다. 원인은 서버 로그에만.
-            Self::Internal(err) => {
-                eprintln!("[internal error] {err:?}");
-                "서버 내부 오류가 발생했습니다.".to_string()
-            }
-            Self::Validation(_) => "요청 값이 규칙에 맞지 않습니다.".to_string(),
-            other => other.to_string(),     // thiserror가 만들어준 Display
-        };
-
-        (status, Json(ErrorBody { error: code, message, details })).into_response()
-    }
-}
-```
-
-### ⭐ 500 오류의 메시지를 숨기는 이유 — 보안
-
-```rust
-Self::Internal(err) => {
-    eprintln!("[internal error] {err:?}");            // 서버 로그에는 전부
-    "서버 내부 오류가 발생했습니다.".to_string()        // 클라이언트에는 일반적인 문구만
-}
-```
-
-DB 에러 메시지를 그대로 내보내면 **테이블명, 컬럼명, 쿼리 구조, 때로는 파일 경로까지** 노출됩니다. 공격자에게 스키마를 알려주는 셈입니다.
-
-- 클라이언트에게는 "내부 오류"만
-- 서버 로그에는 `{err:?}`로 **전체 체인**을 (`{err}`는 최상위 메시지만, `{err:?}`는 원인까지)
-- 실무에서는 여기에 **요청 ID**를 붙여서, 사용자가 신고한 ID로 로그를 찾을 수 있게 합니다.
-
-이건 **Nest/Spring에서도 똑같이 해야 하는 일**인데, 거기서는 기본 동작이 스택트레이스 노출이라 끄는 걸 잊기 쉽습니다. 여기서는 애초에 내가 매핑을 쓰기 때문에 의식하게 됩니다.
-
-### 타입 별칭으로 시그니처 줄이기
-
-```rust
-pub type AppResult<T> = Result<T, AppError>;
-```
-
-핸들러가 이렇게 짧아집니다.
-
-```rust
-// Before (study3)
-) -> Result<Json<Post>, (StatusCode, Json<serde_json::Value>)> {
-
-// After
-) -> AppResult<Json<Post>> {
-```
+- 경로 종류(`/a`, `/a/{id}`, `/files/{*path}`)와 `nest`를 구분해 쓴다.
+- `Path`(어디), `Query`(어떻게)의 역할을 나눈다.
+- 요청 → 미들웨어 → 핸들러 → 응답의 흐름을 로그로 눈으로 확인한다.
+- 404(없는 경로)와 405(없는 메서드)를 **JSON으로** 돌려준다.
+- 프론트(다른 포트)가 호출할 수 있게 CORS를 설정한다.
 
 ---
 
-## 4. extractor 실패를 `AppError`로 흡수하기
+## ② 📖 이론
 
-여기가 study4의 실질적인 작업량입니다. axum 기본 extractor는 각자의 rejection 타입을 갖고, 그 응답은 평문입니다. **한 겹 감싸서 `Rejection = AppError`로 바꿉니다.**
+### 요청이 핸들러에 닿기까지
 
-### `src/extract.rs`
-
-```rust
-/// axum::extract::Path와 같지만 실패가 AppError::BadRequest가 된다.
-pub struct Path<T>(pub T);
-
-impl<T, S> FromRequestParts<S> for Path<T>
-where
-    T: DeserializeOwned + Send,
-    S: Send + Sync,
-{
-    type Rejection = AppError;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        axum::extract::Path::<T>::from_request_parts(parts, state)
-            .await
-            .map(|axum::extract::Path(value)| Path(value))
-            .map_err(|rejection| AppError::BadRequest(rejection.body_text()))
-    }
-}
+```
+브라우저/curl
+   │  GET /api/users/42?page=2
+   ▼
+[미들웨어 계층]  ← 로깅·CORS·압축… (바깥 → 안쪽 순으로 통과)
+   ▼
+[Router]  경로 + 메서드 매칭
+   ├─ 경로 매칭 O, 메서드 매칭 O → 핸들러 실행 (extractor가 먼저 값을 꺼냄)
+   ├─ 경로 매칭 O, 메서드 X      → 405 Method Not Allowed
+   └─ 경로 매칭 X                → fallback (404)
+   ▼
+[핸들러] → IntoResponse → 응답
+   ▲
+[미들웨어 계층]  ← 응답이 나갈 때는 안쪽 → 바깥 순서로 다시 통과
 ```
 
-`Query<T>`도 똑같은 패턴입니다. 그리고 `ValidatedJson<T>`의 `Rejection`도 `AppError`로 바꿉니다.
+### 경로와 쿼리의 역할
 
-```rust
-impl<T, S> FromRequest<S> for ValidatedJson<T> {
-    type Rejection = AppError;
-
-    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let Json(value) = Json::<T>::from_request(req, state).await?;   // JsonRejection → AppError
-        value.validate()?;                                             // ValidationErrors → AppError
-        Ok(ValidatedJson(value))
-    }
-}
-```
-
-두 `?`가 동작하려면 `From` 두 개가 필요합니다.
-
-```rust
-impl From<JsonRejection> for AppError {
-    fn from(rejection: JsonRejection) -> Self {
-        AppError::InvalidBody {
-            status: rejection.status(),      // axum의 판단(400/415/422)을 살린다
-            message: rejection.body_text(),
-        }
-    }
-}
-
-impl From<validator::ValidationErrors> for AppError {
-    fn from(errors: validator::ValidationErrors) -> Self {
-        AppError::Validation(errors)
-    }
-}
-```
-
-### ⚠️ 이름이 같은 타입을 쓰는 트릭
-
-```rust
-use crate::extract::{Path, Query};        // 내 래퍼
-// axum::extract::Path 는 import하지 않는다
-```
-
-내 `Path`가 `axum::extract::Path`를 **가립니다(shadowing).** 덕분에 핸들러 코드는 **한 글자도 안 바뀝니다.**
-
-```rust
-pub async fn get_one(State(state): State<AppState>, Path(id): Path<i64>) -> AppResult<Json<Post>> {
-```
-
-`extract.rs` 안에서만 `axum::extract::Path::<T>::from_request_parts(...)`처럼 **완전 경로**로 원본을 부릅니다. — 실무에서 자주 쓰는 패턴입니다. 다만 **"이 `Path`가 어느 쪽이지?"** 하고 헷갈릴 수 있으니, 파일 상단 주석으로 의도를 남겨두는 게 좋습니다.
-
----
-
-## 5. 404와 405 — 라우터 차원의 fallback
-
-extractor를 다 감싸도 **라우터에 도달조차 못 한 요청**은 여전히 빈 응답입니다.
-
-```rust
-fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(root))
-        .nest("/posts", posts::router())
-        .fallback(handle_404)                       // 매칭되는 경로 없음
-        .method_not_allowed_fallback(handle_405)    // 경로는 있는데 메서드가 없음
-        .with_state(state)
-}
-```
-
-```rust
-/// 404 — 핸들러가 AppError를 그냥 반환해도 된다. AppError가 IntoResponse니까.
-pub async fn handle_404() -> AppError {
-    AppError::NotFound { resource: "route", id: "(unknown)".to_string() }
-}
-
-/// 405
-pub async fn handle_405() -> Response {
-    (
-        StatusCode::METHOD_NOT_ALLOWED,
-        Json(json!({
-            "error": "method_not_allowed",
-            "message": "이 경로에서 지원하지 않는 HTTP 메서드입니다.",
-        })),
-    ).into_response()
-}
-```
-
-- **`handle_404`의 반환 타입이 `AppError`** 인 것에 주목하세요. `AppError`가 `IntoResponse`이므로 **핸들러 반환 타입으로 직접 쓸 수 있습니다.** "항상 실패하는 핸들러"라면 이게 가장 짧습니다.
-- `.method_not_allowed_fallback()`을 안 붙이면 405는 **본문 없이** 나갑니다. 별개 메서드라는 걸 몰라서 빠뜨리기 쉽습니다.
-- `.fallback()`을 `.nest()` **뒤에** 붙였는데도 하위 라우터까지 적용됩니다. (하위 라우터가 자체 fallback을 갖고 있으면 그쪽이 우선)
-
----
-
-## 6. 실행 및 검증
-
-| # | 요청 | 상태 | 응답 본문 |
+| | 예 | 역할 | extractor |
 |---|---|---|---|
-| 1 | `GET /nope` | `404` | `{"error":"not_found","message":"route (unknown) not found"}` |
-| 2 | `DELETE /health` | `405` | `{"error":"method_not_allowed","message":"이 경로에서 지원하지 않는 HTTP 메서드입니다."}` |
-| 3 | `GET /posts/999` | `404` | `{"error":"not_found","message":"post 999 not found"}` |
-| 4 | `GET /posts/abc` | `400` | `{"error":"bad_request","message":"Invalid URL: Cannot parse 'abc' to a 'i64'"}` |
-| 5 | `GET /echo` | `400` | `{"error":"bad_request","message":"Failed to deserialize query string: missing field 'message'"}` |
-| 6 | `POST /posts` `{"title":"",...}` | `422` | `{"error":"validation_failed","message":"요청 값이 규칙에 맞지 않습니다.","details":{"title":["제목은 1~100자여야 합니다"]}}` |
-| 7 | `POST /posts` (`text/plain`) | `415` | `{"error":"invalid_body","message":"Expected request with 'Content-Type: application/json'"}` |
-| 8 | `GET /boom` | `500` | `{"error":"internal_error","message":"서버 내부 오류가 발생했습니다."}` |
-| 9 | `GET /posts/1` | `200` | `{"id":1,"title":"Seed",...}` (정상 동작 확인) |
+| **경로** | `/users/42` | **무엇**을 가리키는가 (자원 식별) | `Path<T>` |
+| **쿼리** | `?page=2&q=mi` | 그 자원을 **어떻게** 보여 줄까 (필터·정렬·페이지) | `Query<T>` |
 
-**8번의 서버 콘솔에는** 클라이언트에게 안 나간 원인이 찍힙니다.
+REST 이름 규칙(공통 API 스펙 v1): 복수 명사·소문자·하이픈, **동사 금지**(`/api/getPosts` ✗), 수정은 `PATCH`.
 
-```
-[internal error] 설정 값 파싱 실패: invalid digit found in string
-```
+### 경로 문법 (axum 0.8)
 
-### 목표 달성 확인
+| 패턴 | 매칭 예 | 비고 |
+|---|---|---|
+| `/users` | `/users` | 정적 |
+| `/users/{id}` | `/users/42` | **한 구간**을 변수로. (0.7까지는 `:id`) |
+| `/files/{*path}` | `/files/a/b/c.txt` → `"a/b/c.txt"` | **나머지 전부**를 한 문자열로 |
+| `.nest("/api", router)` | `/api/...` | 접두어 붙이기 |
 
-이제 **모든 오류 응답이 `{"error": ..., "message": ...}` 형태**입니다. 클라이언트는 이렇게 쓸 수 있습니다.
+### 상태 코드 — 라우팅 단계에서 나오는 것
 
-```typescript
-if (!res.ok) {
-  const { error, message, details } = await res.json();
-  switch (error) {
-    case "validation_failed": showFieldErrors(details); break;
-    case "not_found":         show404(); break;
-    case "unauthorized":      redirectToLogin(); break;
-    default:                  toast(message);
-  }
+| 코드 | 의미 | 누가 만드나 |
+|---|---|---|
+| 301/308 | 영구 이동 | `Redirect::permanent` (**308**) |
+| 302/303/307 | 임시 이동 | `Redirect::to`(303), `temporary`(307) |
+| 400 | 경로·쿼리 파싱 실패 | extractor |
+| 404 | 없는 경로 | `fallback` |
+| 405 | 경로는 있는데 메서드가 다름 | `method_not_allowed_fallback` |
+
+---
+
+## ③ 🛠️ 실기
+
+### 3-1. 전체 코드 — [lab/examples/s04_routing.rs](lab/examples/s04_routing.rs)
+
+```rust
+use std::time::Instant;
+use axum::{
+    Json, Router,
+    extract::{Path, Query, Request},
+    http::{Method, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Redirect, Response},
+    routing::get,
+};
+use serde::Deserialize;
+use serde_json::json;
+use tower_http::cors::CorsLayer;
+
+#[tokio::main]
+async fn main() {
+    let cors = CorsLayer::new()
+        .allow_origin("http://localhost:5173".parse::<header::HeaderValue>().unwrap())
+        .allow_methods([Method::GET, Method::POST]);
+
+    let api = Router::new()
+        .route("/users", get(list_users))
+        .route("/users/{id}", get(get_user))
+        .route("/files/{*path}", get(get_file));
+
+    let app = Router::new()
+        .route("/", get(|| async { "라우팅 예제" }))
+        .route("/old-users", get(|| async { Redirect::permanent("/api/users") }))
+        .nest("/api", api)
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
+        .layer(cors)
+        .layer(middleware::from_fn(log_requests));
+    // ... bind & serve
+}
+
+#[derive(Deserialize)]
+struct ListQuery {
+    #[serde(default = "one")] page: u32,
+    #[serde(default = "ten")] limit: u32,
+    q: Option<String>,
+}
+fn one() -> u32 { 1 }
+fn ten() -> u32 { 10 }
+
+async fn list_users(Query(q): Query<ListQuery>) -> Json<serde_json::Value> {
+    Json(json!({ "page": q.page, "limit": q.limit.clamp(1, 50), "q": q.q }))
+}
+
+async fn get_user(Path(id): Path<u32>) -> Result<Json<serde_json::Value>, StatusCode> {
+    if id == 42 { Ok(Json(json!({ "id": 42, "name": "mina" }))) } else { Err(StatusCode::NOT_FOUND) }
+}
+
+async fn get_file(Path(path): Path<String>) -> String {
+    format!("요청한 경로: {path}")
+}
+
+async fn not_found() -> Response {
+    (StatusCode::NOT_FOUND,
+     Json(json!({ "error": { "code": "NOT_FOUND", "message": "없는 경로입니다." } }))).into_response()
+}
+
+async fn method_not_allowed() -> Response {
+    (StatusCode::METHOD_NOT_ALLOWED,
+     Json(json!({ "error": { "code": "METHOD_NOT_ALLOWED", "message": "지원하지 않는 메서드입니다." } }))).into_response()
+}
+
+async fn log_requests(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let started = Instant::now();
+
+    let response = next.run(request).await;
+
+    println!("{method} {uri} → {} ({:.1}ms)", response.status().as_u16(),
+             started.elapsed().as_secs_f64() * 1000.0);
+    response
 }
 ```
 
----
+### 3-2. 줄별 설명
 
-## 7. 다른 프레임워크와 비교
+| 코드 | 설명 |
+|---|---|
+| `.route("/files/{*path}", ...)` | `*`가 붙은 변수는 슬래시를 포함한 나머지를 모두 받는다 |
+| `Redirect::permanent("/api/users")` | **308 Permanent Redirect**. 브라우저·검색엔진이 "옮겨졌다"고 기억한다. 임시라면 `Redirect::temporary`(307) |
+| `.nest("/api", api)` | `api`의 모든 경로 앞에 `/api` |
+| `.fallback(not_found)` | 어떤 라우트에도 안 걸린 요청. 핸들러가 `Response`를 돌려주므로 **상태 코드와 본문을 직접 정한다** |
+| `.method_not_allowed_fallback(...)` | 경로는 있는데 메서드가 없을 때만. 기본 응답은 본문이 빈 405 |
+| `#[serde(default = "one")]` | 쿼리에 `page`가 없으면 `one()`의 값(1). 이게 없으면 `page`를 빠뜨린 요청이 400 |
+| `q.limit.clamp(1, 50)` | **범위 밖 값은 서버가 잘라 낸다.** `limit=999`가 DB를 괴롭히지 못하게 |
+| `.layer(cors).layer(middleware::from_fn(log_requests))` | `.layer()`를 여러 번 부르면 **나중에 붙인 것이 바깥**이다 (아래 순서 주의) |
+| `next.run(request).await` | 이 줄 **앞**은 "요청이 들어올 때", **뒤**는 "응답이 나갈 때" |
+| `request.method().clone()` | `next.run(request)`가 요청을 **소비(move)** 하므로 필요한 값은 미리 복사해 둔다 |
+| `CorsLayer::new().allow_origin(...)` | 지정한 출처에서 온 브라우저 요청을 허용한다 |
 
-| | Spring Boot | NestJS | FastAPI | Axum |
-|---|---|---|---|---|
-| 방식 | `@RestControllerAdvice` + `@ExceptionHandler` | 전역 `ExceptionFilter` | `@app.exception_handler` | `IntoResponse for AppError` |
-| 적용 지점 | 예외가 **던져지면** 프레임워크가 가로챔 | 동일 | 동일 | **반환 타입이 `Result`라서 자연스럽게 통과** |
-| 누락 감지 | 런타임 (안 잡히면 500) | 런타임 | 런타임 | **컴파일 타임** (`match` 완전성) |
-| 예상 못 한 예외 | 자동으로 500 (스택트레이스 노출 주의) | 동일 | 동일 | **`?`로 전파하지 않으면 애초에 컴파일 안 됨** |
-
-**Axum 쪽의 장단:**
-
-- 👍 "이 함수가 실패할 수 있다"가 **시그니처에 드러납니다.** 호출자가 모를 수 없습니다.
-- 👍 에러 변형을 추가하면 **매핑을 빠뜨린 곳이 전부 컴파일 에러**로 보입니다.
-- 👎 **`?`를 일일이 붙여야 합니다.** 예외처럼 "알아서 위로 올라가는" 편의는 없습니다.
-- 👎 extractor rejection을 흡수하려면 **래퍼를 직접 만들어야 합니다.** 위에서 한 작업이 그겁니다.
-
----
-
-## 8. 처음 만난 오류 / 주의점
-
-### 8-1. `variants ... are never constructed` 경고
+### 3-3. 실행 결과
 
 ```
-warning: variants `Unauthorized`, `Forbidden`, and `Conflict` are never constructed
+$ curl "http://127.0.0.1:3004/api/users?page=2&limit=999&q=mi"
+{"limit":50,"page":2,"q":"mi"}                      ← limit이 50으로 잘렸다
+
+$ curl http://127.0.0.1:3004/api/users/42
+{"id":42,"name":"mina"}
+
+$ curl -o /dev/null -w "%{http_code}" http://127.0.0.1:3004/api/users/abc
+400                                                 ← Path<u32> 파싱 실패
+
+$ curl http://127.0.0.1:3004/api/files/a/b/c.txt
+요청한 경로: a/b/c.txt
+
+$ curl -i http://127.0.0.1:3004/old-users
+HTTP/1.1 308 Permanent Redirect
+location: /api/users
+
+$ curl http://127.0.0.1:3004/nope
+{"error":{"code":"NOT_FOUND","message":"없는 경로입니다."}}
+
+$ curl -X POST http://127.0.0.1:3004/
+{"error":{"code":"METHOD_NOT_ALLOWED","message":"지원하지 않는 메서드입니다."}}
+
+$ curl -i -H 'Origin: http://localhost:5173' http://127.0.0.1:3004/api/users | grep -i access-control
+access-control-allow-origin: http://localhost:5173
 ```
 
-- study6/7에서 쓸 변형을 미리 선언해 두면 **dead_code 경고**가 뜹니다. 오류는 아니지만 빌드 로그가 지저분해집니다.
-- 해결: 해당 변형에 `#[allow(dead_code)]`를 붙이거나, **실제로 쓸 때 추가**합니다.
-- Rust는 이런 "쓰이지 않는 코드"를 꽤 집요하게 알려줍니다. 처음엔 잔소리 같지만, 리팩터링 후 남은 죽은 코드를 찾는 데 실제로 유용합니다.
-
-### 8-2. `?`가 안 되는데 "trait `From` is not implemented"
+서버 콘솔(`log_requests`가 찍은 흐름):
 
 ```
-error[E0277]: `?` couldn't convert the error to `AppError`
-   = help: the trait `From<sqlx::Error>` is not implemented for `AppError`
+GET / → 200 (0.1ms)
+GET /api/users?page=2&limit=999&q=mi → 200 (0.1ms)
+GET /api/users/abc → 400 (0.0ms)
+GET /old-users → 308 (0.0ms)
+GET /nope → 404 (0.0ms)
 ```
-
-`?`는 **`From`이 있어야만** 자동 변환합니다. 새 오류 종류를 만나면 둘 중 하나를 하세요.
-
-```rust
-// 방법 1: AppError에 변형 추가 + #[from]
-#[error(transparent)]
-Database(#[from] sqlx::Error),
-
-// 방법 2: 그 자리에서 map_err
-.map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?
-```
-
-study5에서 sqlx를 붙일 때 이 선택을 실제로 하게 됩니다.
-
-### 8-3. `#[error(transparent)]`와 `#[error("{0}")]`의 차이
-
-```rust
-#[error(transparent)]
-Internal(#[from] anyhow::Error),      // Display = 감싼 에러의 메시지 그대로
-
-#[error("내부 오류: {0}")]
-Internal2(#[from] anyhow::Error),     // Display = "내부 오류: <원본 메시지>"
-```
-
-`transparent`는 **껍데기를 씌우지 않겠다**는 선언입니다. `Internal`은 어차피 클라이언트에게 메시지를 안 보내므로 껍데기가 의미 없어서 `transparent`를 썼습니다.
 
 ---
 
-## 9. 이번 study 정리
+## ④ 🔗 연동 포인트
 
-- 오류 응답 **계약**(`error` / `message` / `details`)을 먼저 정하고 시작한다.
-- `thiserror`로 앱 전용 `enum AppError`를 만들고 **`IntoResponse`를 한 번만** 구현한다. 이게 전역 예외 핸들러를 대신한다.
-- `#[from]`을 붙이면 `?`가 자동 변환한다. `thiserror`(구분이 필요한 에러) / `anyhow`(구분이 필요 없는 에러)를 나눠 쓴다.
-- **500 응답에는 내부 메시지를 절대 담지 않는다.** 로그에만 남긴다.
-- extractor 실패까지 통일하려면 `Path`/`Query`/`Json`을 **감싼 래퍼**를 만들고 `type Rejection = AppError`로 지정한다.
-- 라우터 밖의 오류는 `.fallback()`(404)과 `.method_not_allowed_fallback()`(405)로 잡는다.
-- `enum` + `match`라서 **에러 종류를 추가하면 처리 누락이 컴파일 에러**로 드러난다. 이게 다른 프레임워크 대비 가장 큰 이점이다.
+### 쿼리 파라미터와 페이지 이동
 
-다음: [study5.md](study5.md) — sqlx + SQLite로 데이터를 실제로 영속화하기.
+- 목록 화면의 상태(검색어, 페이지)는 **URL 쿼리에 둔다.** 새로고침·뒤로가기·링크 공유가 공짜로 된다.
+- 프론트: `/posts?page=2&q=axum` ↔ 백엔드: `GET /api/posts?page=2&q=axum` — **같은 이름**을 쓰면 프론트가 URL의 쿼리를 그대로 API에 넘길 수 있다.
+- 페이지 이동은 프론트 라우터가, 데이터 가져오기는 `fetch`가 맡는다. 서버는 `/api` 아래만 신경 쓴다.
+
+### 프론트와 백엔드 경로 맞추기
+
+| 방식 | 구성 | 장단점 |
+|---|---|---|
+| **같은 출처로 서빙** | Axum이 `/api`와 정적 파일(`/`)을 함께 서빙 | CORS 불필요, 쿠키 단순. 배포도 하나 (**studyFinal이 이 방식**) |
+| **개발 서버 프록시** | Vite `server.proxy: { "/api": "http://127.0.0.1:3000" }` | 브라우저는 같은 출처로 보인다. CORS 설정 불필요 |
+| **CORS 허용** | 프론트 `:5173` → API `:3000` 직접 호출 + `CorsLayer` | 설정 필요, 쿠키를 쓰면 `credentials` + 정확한 Origin (study12) |
+
+경로 합의는 문서 한 장으로 한다 — **공통 API 스펙 v1**(Base URL `/api`, `/api/posts`, `/api/posts/{id}`, `/api/auth/login` …). 이 저장소의 `demo/`는 현재 `/api` 접두어 없이 `/posts`, `/auth/*`를 쓰고 있다 (study6의 확인 결과 참고).
+
+### CORS는 서버가 아니라 **브라우저**가 막는다
+
+`curl`로는 항상 되는 요청이 브라우저에서만 실패하면 CORS다. 서버는 `access-control-allow-origin` 헤더로 "이 출처는 허용"이라고 **알려 줄 뿐**이고, 헤더가 요청 출처와 맞지 않으면 **브라우저가 응답을 JS에 넘기지 않는다.** (서버 로그에는 정상 200이 찍힌다)
+
+---
+
+## ⑤ 오류 노트
+
+| 증상 | 원인 | 해결 |
+|---|---|---|
+| 서버 시작 시 패닉 `Path segments must not start with ':'` | 0.8에서 `:id` → `{id}` | `{id}` 사용 |
+| `/api/users/abc` → 400, 본문이 **평문** | `Path<u32>` 파싱 실패의 기본 응답 | study5/6에서 `Path`를 감싸 JSON 오류로 통일 (demo의 `extract::Path`) |
+| `limit` 없이 호출했더니 400 | `#[serde(default)]`를 안 붙임 | 선택 파라미터는 `Option<T>` 또는 `#[serde(default = "...")]` |
+| `/users/`(끝 슬래시)가 404 | axum은 `/users`와 `/users/`를 **다르게** 본다 | 한 가지로 통일해 두거나 `tower-http`의 `NormalizePathLayer` (demo의 `normalize-path` feature) |
+| 브라우저 콘솔 `blocked by CORS policy` 인데 curl은 성공 | 허용 출처 불일치 (포트·스킴·`localhost` vs `127.0.0.1` 포함) | `allow_origin`을 **브라우저 주소창의 출처와 글자 그대로** 맞춘다 |
+| CORS 설정을 했는데 **POST만** 실패 | `Content-Type: application/json`은 "단순 요청"이 아니라 **사전 요청(OPTIONS preflight)** 을 먼저 보냄 | `allow_methods`/`allow_headers`에 필요한 것을 모두 포함. `OPTIONS`는 `CorsLayer`가 자동 응답 |
+| 존재하는 경로인데 404 | `nest` 안에서 `"/"`를 빼먹음 / 접두어를 두 번 붙임 (`nest("/api")` 안에 `/api/users`) | 최종 경로를 손으로 이어 붙여 확인 |
+| 404 JSON 대신 빈 본문 404 | `fallback`을 등록하지 않았거나, **정적 파일 서비스**(`ServeDir`)가 404를 만듦 | 미들웨어에서 4xx를 감싸 통일 (demo의 `error_envelope`, study14) |
+| `.layer()`를 붙였는데 일부 경로에 적용 안 됨 | `.layer()`는 **그 시점까지 등록된 라우트**에만 적용된다 | 공통 계층은 **라우트 등록을 모두 끝낸 뒤** 마지막에 붙인다 |
+| `GET /old-users`가 301이 아니라 308 | `Redirect::permanent`는 308 (메서드를 유지하는 영구 이동) | 정상. 301을 원하면 직접 상태 코드와 `Location`을 만든다 |
+
+---
+
+## ⑥ 직접 해보기
+
+1. **끝 슬래시 실험**: `/api/users/`를 호출해 404가 나는지 확인하고, 두 형태를 모두 받도록 만든다. (`NormalizePathLayer`, 또는 두 경로 등록)
+2. **`/api/users/{id}/posts/{post_id}`**: `Path<(u32, u32)>`로 두 파라미터를 받는다. 구조체(`#[derive(Deserialize)] struct Ids { id: u32, post_id: u32 }`)로 받는 방식과 비교해 본다.
+3. **CORS 직접 깨 보기**: [study12](study12.md)의 `s12_front` 또는 간단한 HTML을 다른 포트로 띄워 `fetch`하고, 개발자도구 Network 탭에서 `OPTIONS` 사전 요청과 응답 헤더를 확인한다. `allow_origin`을 일부러 틀리게 바꿔 콘솔 오류 문구를 읽는다.
+
+---
+
+## ⑦ ☐ 체크리스트
+
+- ☐ `/x`, `/x/{id}`, `/x/{*rest}`, `nest`의 차이를 설명할 수 있다
+- ☐ `Path`와 `Query`의 역할 차이를 설명할 수 있다
+- ☐ 404와 405가 어디서 나오는지, 각각을 JSON으로 바꾸는 방법을 안다
+- ☐ 미들웨어에서 `next.run(request)` 앞뒤가 각각 언제 실행되는지 설명할 수 있다
+- ☐ `.layer()`는 **나중에 붙인 것이 바깥**이고, 그 시점까지 등록된 라우트에만 적용된다는 것을 안다
+- ☐ `Redirect::permanent`(308)와 `temporary`(307)의 차이를 안다
+- ☐ CORS가 서버가 아니라 브라우저의 검사이고, preflight가 무엇인지 설명할 수 있다
+- ☐ 프론트와 백엔드가 같은 쿼리 이름을 쓰면 왜 편한지 설명할 수 있다
+- ☐ 프론트와 백엔드 경로를 맞추는 세 방법(같은 출처 / 프록시 / CORS)의 차이를 안다
+
+---
+
+## ⑧ 다음 단계 연결
+
+경로를 통해 요청이 들어오는 길을 만들었으니, [study5](study5.md)에서는 그 요청의 **본문(사용자 입력)** 을 받아 검증하고, 틀렸을 때 필드별 오류 메시지를 돌려주고, 중복 제출을 막는 폼 흐름을 만든다.
