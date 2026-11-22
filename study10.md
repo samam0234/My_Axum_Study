@@ -1,231 +1,93 @@
-# OpenAPI 문서화 & Docker 배포 (Study 10 · 고급 5)
+# study10 — 배포 · 기초 구간 정리
 
-API를 만들었으면 **남이 쓸 수 있어야** 하고, **어디서든 돌아가야** 합니다. 마지막 고급 문서에서 그 두 가지를 합니다.
+> 🎯 **목표**: 릴리스 빌드와 **멀티 스테이지 Docker 이미지**로 서버를 패키징하고, 도메인·HTTPS의 개념을 이해하며, 배포 환경에서 환경변수·DB를 잇는 방법과 **배포 후 점검표**를 갖춘다. 마지막에 기초 구간(study0~10) 전체를 정리한다.
 
-**이 문서에서 하는 것**: `utoipa`로 OpenAPI 명세 생성 + Swagger UI + 릴리스 빌드 최적화 + 멀티 스테이지 Dockerfile
-
-```powershell
-cargo add utoipa --features axum_extras,chrono
-cargo add utoipa-swagger-ui --features axum
-```
-
----
-
-## 1. Rust에는 자동 문서화 마법이 없다
-
-| 프레임워크 | 방식 | 손이 가는 정도 |
-|---|---|---|
-| **FastAPI** | 타입힌트만으로 **완전 자동** (`/docs` 기본 제공) | 0 |
-| **NestJS** | `@nestjs/swagger` + 플러그인 (DTO에서 자동 추론) | 낮음 |
-| **Spring Boot** | springdoc (애노테이션에서 추론) | 낮음 |
-| **Axum + utoipa** | **`#[utoipa::path(...)]`를 직접 작성** | **높음** |
-
-이유는 명확합니다. **Rust에는 런타임 리플렉션이 없습니다.** 실행 중에 "이 함수의 인자 타입이 뭐지?"를 물어볼 수 없습니다. 그래서 컴파일 타임 매크로로 정보를 **미리 적어 둬야** 합니다.
-
-**장단:**
-- 👎 라우트마다 어노테이션을 쓴다. 코드와 문서가 어긋날 수 있다.
-- 👍 문서에 나갈 내용(설명, 상태 코드, 예시, 보안 요구사항)을 **정확히 통제**한다. 자동 추론이 만들어내는 이상한 스키마가 없다.
-
-> `utoipa-axum`의 `OpenApiRouter`를 쓰면 라우터 등록과 문서 등록을 한 번에 할 수 있어 어긋남을 줄일 수 있습니다. 여기서는 개념이 잘 드러나도록 기본 방식을 씁니다.
+| 항목 | 내용 |
+|---|---|
+| 관련 파일 | [demo/Dockerfile](demo/Dockerfile), [demo/.dockerignore](demo/.dockerignore), [demo/compose.yaml](demo/compose.yaml), [demo/compose.postgres.yaml](demo/compose.postgres.yaml), [demo/Cargo.toml](demo/Cargo.toml) `[profile.release]`, [demo/src/main.rs](demo/src/main.rs) (`shutdown_signal`) |
+| **검증** | Docker 28.3 — 이미지를 **실제로 빌드하고 컨테이너로 실행**해 헬스체크·영속성·종료 동작을 확인했다 (아래 측정값은 모두 실측) |
+| 이 단계에서 고친 것 | ① `utoipa-swagger-ui`에 `vendored` feature (Docker 빌드가 **빌드 중 네트워크·curl에 의존**해서 실패) ② `docker stop`이 SIGTERM을 못 받아 **10초 뒤 강제 종료**되던 것 (`shutdown_signal`) ③ 이미지 빌드 인자 `CARGO_FLAGS` 추가 ④ 시작 로그에 **DB 비밀번호가 평문으로** 찍히던 것 (`redacted_database_url`) |
 
 ---
 
-## 2. 스키마 등록 — `ToSchema`
+## ① 목표
 
-```rust
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct Post {
-    pub id: i64,
-    pub title: String,
-    // ...
-}
-
-#[derive(Debug, Deserialize, Validate, ToSchema)]
-pub struct CreatePost { /* ... */ }
-```
-
-- `ToSchema`는 **JSON 스키마 조각을 만드는 코드를 생성**합니다.
-- `chrono` feature를 켰기 때문에 `DateTime<Utc>`가 `"type": "string", "format": "date-time"`으로 나갑니다.
-- **`UserRow`에는 일부러 안 붙였습니다.** study6에서 `Serialize`를 안 붙인 것과 같은 이유 — 비밀번호 해시가 문서에도 나가면 안 됩니다.
-
-### 쿼리 파라미터 — `IntoParams`
-
-```rust
-#[derive(Debug, Deserialize, Validate, IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct PageQuery { /* page, per_page, q, tag */ }
-```
-
-`ToSchema`(본문 스키마)와 `IntoParams`(쿼리/경로 파라미터)는 **다른 trait**입니다. 헷갈리기 쉽습니다.
-
-### 제네릭 스키마 — `Page<T>`
-
-```rust
-// utoipa 5는 제네릭 스키마를 그대로 지원한다. (4까지 있던 #[aliases]는 제거됨)
-#[derive(Debug, Serialize, ToSchema)]
-pub struct Page<T> { /* ... */ }
-```
-
-등록할 때 구체 타입으로 적습니다.
-
-```rust
-components(schemas(
-    crate::pagination::Page<crate::posts::model::Post>,
-    // ...
-))
-```
-
-생성된 스키마 이름은 **`Page_Post`** 가 됩니다(아래 실행 결과 참고).
-
-> ⚠️ utoipa 4까지는 `#[aliases(PostPage = Page<Post>)]`를 썼는데 **5에서 제거**되었습니다. 그대로 쓰면 `cannot find attribute 'aliases' in this scope` 에러가 납니다. 아래 6-1 참고.
+1. `cargo build --release`의 의미와 `[profile.release]` 설정을 이해한다.
+2. 멀티 스테이지 Dockerfile(의존성 레이어 캐싱 포함)로 이미지를 만든다.
+3. 컨테이너에서 설정(환경변수)·데이터(볼륨)·비밀(주입)을 다루는 방법을 안다.
+4. 도메인·DNS·HTTPS가 서버 앞에서 어떻게 이어지는지 설명할 수 있다.
+5. 배포 직후 확인할 점검표를 갖는다.
 
 ---
 
-## 3. 라우트 문서화 — `#[utoipa::path]`
+## ② 📖 이론
 
-```rust
-#[utoipa::path(
-    get,
-    path = "/posts",
-    tag = "posts",
-    params(PageQuery),
-    responses(
-        (status = 200, description = "게시글 페이지", body = Page<Post>),
-        (status = 422, description = "페이지 파라미터 범위 오류"),
-    )
-)]
-pub async fn list(/* ... */) { }
+### 배포 = "내 컴퓨터에서 돌던 것"을 "다른 컴퓨터에서 똑같이" 돌리기
+
+Rust는 결과물이 **바이너리 하나**라서 배포가 단순한 편이다. 그래도 컨테이너를 쓰는 이유는 **실행 환경 전체**(OS 라이브러리, 비root 사용자, 환경변수, 헬스체크, 볼륨)를 한 단위로 묶기 위해서다.
+
+### 멀티 스테이지 빌드
+
+```
+[빌더 스테이지]  rust:1.98-slim  ← 컴파일러·의존성 소스·중간 산출물 (수 GB)
+        │ 바이너리 하나(19MB)만 복사
+        ▼
+[런타임 스테이지] debian:bookworm-slim + ca-certificates + curl  ← 컴파일러 없음. 최종 이미지 160MB
 ```
 
-```rust
-#[utoipa::path(
-    post,
-    path = "/posts",
-    tag = "posts",
-    request_body = CreatePost,
-    security(("bearer_auth" = [])),        // ← 이 라우트는 토큰이 필요하다
-    responses(
-        (status = 201, description = "생성됨", body = Post),
-        (status = 401, description = "인증 필요"),
-        (status = 422, description = "검증 실패"),
-    )
-)]
-pub async fn create(/* ... */) { }
+컴파일에 필요한 것과 실행에 필요한 것은 다르다. 빌더는 버리고 **바이너리만** 런타임에 옮긴다.
+
+### 의존성 레이어 캐싱 트릭 (Rust에서 특히 중요)
+
+Docker는 줄(레이어)마다 결과를 캐시하고, **그 줄의 입력이 바뀌지 않으면 재사용**한다. Rust는 컴파일이 느려서 소스 한 줄을 고칠 때마다 의존성 수백 개를 다시 컴파일하면 곤란하다.
+
+```dockerfile
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs \
+    && cargo build --release && rm -rf src     # ① 가짜 소스로 의존성만 컴파일 → 레이어로 캐시
+COPY src ./src                                 # ② 진짜 소스 (자주 바뀐다)
+RUN touch src/main.rs src/lib.rs && cargo build --release   # ③ 내 코드만 컴파일
 ```
 
-- **`path`는 라우터에 등록한 실제 경로 전체**를 적습니다. `nest("/posts", ...)` 아래에 있어도 `/posts`라고 씁니다. **여기가 어긋나기 가장 쉬운 지점**입니다.
-- 경로 파라미터는 `params(("id" = i64, Path, description = "게시글 id"))`.
-- `security(...)`를 적은 라우트만 Swagger UI에서 자물쇠 아이콘이 붙습니다.
+실측: 첫 빌드에서 의존성 컴파일(①) **58초** + 내 코드 컴파일(③) **23초**. 이후 소스만 고쳐 다시 빌드하면 ①이 `CACHED`로 건너뛰어져 ③만 다시 컴파일한다.
 
----
+### 도메인 · DNS · HTTPS
 
-## 4. 명세 조립 — `#[derive(OpenApi)]`
-
-`src/openapi.rs`:
-
-```rust
-#[derive(OpenApi)]
-#[openapi(
-    info(
-        title = "Axum 학습용 게시판 API",
-        version = "0.1.0",
-        description = "study1~10에서 단계적으로 만든 게시판 + 인증 API",
-    ),
-    paths(
-        crate::auth::handler::register,
-        crate::auth::handler::login,
-        crate::auth::handler::me,
-        crate::posts::handler::list,
-        // ... 전부 나열
-    ),
-    components(schemas(
-        crate::posts::model::Post,
-        crate::pagination::Page<crate::posts::model::Post>,
-        // ...
-    )),
-    modifiers(&SecurityAddon),
-    tags(
-        (name = "auth", description = "회원가입 / 로그인 / 내 정보"),
-        (name = "posts", description = "게시판 CRUD"),
-    )
-)]
-pub struct ApiDoc;
+```
+브라우저 ── https://board.example.com ──▶ [DNS] 도메인 → 서버 IP 를 알려 준다 (A/AAAA 레코드)
+                                       ▼
+                               [리버스 프록시: Caddy / nginx / 클라우드 로드밸런서]
+                                  · HTTPS(TLS) 종료: 인증서로 암호화를 풀어 준다
+                                  · 80 → 443 리다이렉트
+                                       │  http (내부망)
+                                       ▼
+                               [Axum 컨테이너 :3000]
 ```
 
-### 보안 스킴 — Swagger UI의 "Authorize" 버튼
+| 개념 | 설명 |
+|---|---|
+| **도메인** | 사람이 읽는 이름. 구매 후 DNS에서 서버 IP로 연결 |
+| **DNS A 레코드** | `board.example.com → 203.0.113.10` |
+| **HTTPS / TLS** | 통신 암호화 + 서버 신원 증명. 비밀번호·토큰·쿠키는 HTTPS 없이 보내면 안 된다 |
+| **인증서** | Let's Encrypt가 **무료**로 발급·자동 갱신 (Caddy는 도메인만 적으면 알아서 발급) |
+| **리버스 프록시** | 앞에서 요청을 받아 뒤의 앱으로 전달. HTTPS 종료, 압축, 정적 파일, 속도 제한을 맡길 수 있다 |
+| **`Secure` 쿠키** | HTTPS에서만 쿠키 전송. 프록시 뒤에서는 앱이 `http`로 보이므로 **환경변수로 켠다**(`SECURE_COOKIE=true`) |
 
-```rust
-struct SecurityAddon;
+Axum 앱이 직접 TLS를 처리할 수도 있지만(`axum-server` + rustls), **프록시에서 종료하는 구성이 운영·갱신이 쉬워서** 일반적이다. 앱 앞 프록시 설정 예(Caddyfile):
 
-impl Modify for SecurityAddon {
-    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        if let Some(components) = openapi.components.as_mut() {
-            components.add_security_scheme(
-                "bearer_auth",
-                SecurityScheme::Http(
-                    HttpBuilder::new()
-                        .scheme(HttpAuthScheme::Bearer)
-                        .bearer_format("JWT")
-                        .build(),
-                ),
-            );
-        }
-    }
+```
+board.example.com {
+    reverse_proxy 127.0.0.1:3000
 }
 ```
 
-이게 있어야 Swagger UI 우상단에 **Authorize** 버튼이 생기고, 거기에 토큰을 한 번 넣으면 이후 모든 요청에 `Authorization: Bearer ...`가 자동으로 붙습니다. **문서를 읽는 도구가 아니라 실제로 API를 쳐보는 도구**가 되는 지점입니다.
-
-### 라우터에 장착
-
-```rust
-Router::new()
-    .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", openapi::ApiDoc::openapi()))
-    .route("/", get(routes::root))
-    // ...
-```
-
-`SwaggerUi`는 `Router`로 변환 가능해서 `.merge()`로 붙입니다.
-
-> ⚠️ 운영에서는 **문서를 공개할지** 결정해야 합니다. 내부 API라면 `cfg!(debug_assertions)`나 환경변수로 이 라인을 감싸서 개발 환경에서만 노출하세요. API 구조 전체가 공격자에게 지도가 됩니다.
+한 줄이다. 인증서 발급·갱신·HTTP→HTTPS 리다이렉트를 Caddy가 한다.
 
 ---
 
-## 5. 실행 결과 — 생성된 명세
+## ③ 🛠️ 실기
 
-```powershell
-cargo run
-```
-
-```
-GET /api-docs/openapi.json → 200, 9146 bytes
-
-openapi=3.1.0  title=Axum 학습용 게시판 API  version=0.1.0
-
-paths:   /auth/login, /auth/me, /auth/register,
-         /posts, /posts/{id}, /posts/{id}/thumbnail
-
-schemas: CreatePost, LoginRequest, Page_Post, Post,
-         RegisterRequest, TokenResponse, UpdatePost, UserPublic
-
-securitySchemes: bearer_auth
-```
-
-Swagger UI:
-
-```
-GET /docs → 200, HTML (swagger 자산 로드)
-```
-
-브라우저에서 `http://127.0.0.1:3000/docs`를 열면 실제로 요청을 쏴볼 수 있습니다.
-
-- **`Page_Post`** — 제네릭 `Page<Post>`가 이 이름으로 생성됐습니다.
-- **`UserRow`는 목록에 없습니다.** `ToSchema`를 안 붙였으니 문서에도, 응답에도 나가지 않습니다.
-- `openapi=3.1.0` — utoipa 5는 OpenAPI 3.1을 생성합니다.
-
----
-
-## 6. 릴리스 빌드 최적화
+### 3-1. 릴리스 빌드 — [demo/Cargo.toml](demo/Cargo.toml)
 
 ```toml
 [profile.release]
@@ -233,64 +95,39 @@ opt-level = 3
 lto = "thin"        # 크레이트 경계를 넘는 인라이닝
 codegen-units = 1   # 병렬 컴파일을 포기하고 최적화 기회를 늘린다
 strip = true        # 심볼 제거 (백트레이스는 잃는다)
-# panic = "abort"   # ⚠️ 절대 켜지 말 것
+# panic = "abort"   # ⚠️ 절대 켜지 말 것: CatchPanicLayer가 동작하지 않게 된다
 ```
 
-### 실측
-
-| | 빌드 시간 | 바이너리 크기 |
+| 빌드 (이전 측정) | 시간 | 바이너리 |
 |---|---|---|
-| debug | (증분 수 초) | 16.3 MB |
-| release (기본) | 57.9s | 19.6 MB |
-| release (위 설정) | **89.4s** | **18.5 MB** |
+| `debug` (증분) | 수 초 | 16.3 MB |
+| `release` 기본 | 57.9s | 19.6 MB |
+| `release` 위 설정 | **89.4s** | **18.5 MB** |
 
-**관찰 두 가지:**
+시간은 1.5배 늘고 크기는 1.1MB만 줄었다. **크게 안 줄어든 이유**는 Swagger UI 정적 자산이 바이너리에 박혀 있기 때문이다(`utoipa-swagger-ui`를 빼면 훨씬 작아진다). 이 설정의 이득은 크기보다 **실행 속도**다.
 
-1. **release가 debug보다 큽니다.** 의외인데, Windows에서는 디버그 정보가 `.exe`가 아니라 별도 `.pdb`로 빠지고, release는 공격적인 인라이닝으로 코드가 늘어나기 때문입니다.
-2. **`strip` + `lto`로 1.1MB 줄고, 빌드 시간은 1.5배가 되었습니다.** 크게 줄지 않은 이유는 **Swagger UI 정적 자산이 바이너리에 통째로 박혀 있기** 때문입니다. `utoipa-swagger-ui`를 빼면 훨씬 작아집니다.
-
-### ⚠️ `panic = "abort"`를 켜면 안 되는 이유
-
-바이너리를 더 줄이려고 흔히 켜는 옵션인데, **study7에서 붙인 `CatchPanicLayer`가 동작하지 않게 됩니다.** `abort`는 되감기(unwind)를 아예 하지 않으므로 잡을 패닉 자체가 없고, 프로세스가 즉시 죽습니다. 패닉 하나에 **서버 전체가 내려갑니다.**
-
-> 이런 식으로 **설정 하나가 아키텍처 결정을 무효화하는 경우**가 있습니다. 옵션을 켜기 전에 "이게 무엇을 전제로 하는가"를 확인해야 합니다.
-
----
-
-## 7. Docker — 멀티 스테이지 빌드
-
-### 왜 멀티 스테이지인가
-
-Rust 빌드에는 컴파일러 + 의존성 소스 + 중간 산출물이 필요합니다. **다 합쳐 수 GB**입니다. 하지만 **실행에는 바이너리 하나면 충분**합니다.
-
-```
-[builder 스테이지]  rust:1.98-slim  →  수 GB, 바이너리 생성
-        ↓ 바이너리만 복사
-[runtime 스테이지]  debian:bookworm-slim  →  ~100MB
-```
-
-### `Dockerfile`
+### 3-2. Dockerfile — [demo/Dockerfile](demo/Dockerfile)
 
 ```dockerfile
-# ── 1단계: 빌드 ──────────────────────────────────────────────
 FROM rust:1.98-slim-bookworm AS builder
 WORKDIR /app
 
-# 의존성 레이어 캐싱 트릭
+ARG CARGO_FLAGS=""        # 예: --no-default-features --features postgres
+
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src \
     && echo 'fn main() {}' > src/main.rs \
     && echo '' > src/lib.rs \
-    && cargo build --release \
+    && cargo build --release ${CARGO_FLAGS} \
     && rm -rf src
 
 COPY src ./src
 COPY migrations ./migrations
-RUN touch src/main.rs src/lib.rs && cargo build --release
+COPY migrations_pg ./migrations_pg
+RUN touch src/main.rs src/lib.rs \
+    && cargo build --release ${CARGO_FLAGS}
 
-# ── 2단계: 실행 ──────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
-
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
@@ -308,155 +145,227 @@ ENV DATABASE_URL="sqlite:///app/data/data.db?mode=rwc" \
     UPLOAD_DIR="/app/uploads" \
     BIND_ADDR="0.0.0.0:3000" \
     RUST_LOG="demo=info,tower_http=info"
+# ⚠️ JWT_SECRET은 이미지에 굽지 않는다. 실행할 때 -e 로 주입한다.
 
 EXPOSE 3000
-
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -fsS http://127.0.0.1:3000/health || exit 1
 
 CMD ["demo"]
 ```
 
-### ⭐ 의존성 레이어 캐싱 트릭
+| 코드 | 설명 |
+|---|---|
+| `FROM ... AS builder` / `AS runtime` | 두 스테이지. 최종 이미지는 마지막 스테이지만 남는다 |
+| `ARG CARGO_FLAGS` | 빌드 시 인자로 feature를 고른다. **기본은 SQLite**, PostgreSQL 이미지는 `--build-arg CARGO_FLAGS="--no-default-features --features postgres"` |
+| 가짜 `main.rs`/`lib.rs`로 먼저 빌드 | 의존성 컴파일을 캐시 레이어에 가둔다 (위 ② 참고) |
+| `touch src/main.rs src/lib.rs` | 가짜 빌드의 산출물보다 **소스가 새 것**으로 보이게 해서 다시 컴파일되게 한다. 빠뜨리면 가짜 바이너리가 그대로 나가는 사고가 난다 |
+| `migrations`는 빌더에만 | `sqlx::migrate!`가 SQL을 **컴파일 시점에 바이너리에 박아 넣어서** 런타임 이미지에는 `migrations/`가 필요 없다 |
+| `ca-certificates`, `curl` | 외부 HTTPS 호출용 / `HEALTHCHECK`에서 `/health`를 찌르기 위해 |
+| `useradd appuser` + `USER appuser` | **root로 실행하지 않는다.** 컨테이너가 뚫려도 피해를 줄인다 (실측: `uid=1000(appuser)`) |
+| `VOLUME [...]` | DB·업로드 파일이 사는 곳. 볼륨으로 마운트해야 컨테이너를 지워도 데이터가 산다 |
+| `ENV BIND_ADDR="0.0.0.0:3000"` | **컨테이너 안에서는 `0.0.0.0`**. `127.0.0.1`이면 컨테이너 밖에서 접속할 수 없다 |
+| `JWT_SECRET` 없음 | 이미지에 구운 비밀은 이미지를 가진 모두가 알게 된다. 실행 시 주입 |
+| `HEALTHCHECK` | 오케스트레이터가 "살아 있는가"를 판단하는 기준 |
 
-```dockerfile
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs \
-    && cargo build --release && rm -rf src
-```
-
-**Rust는 컴파일이 느려서 이 트릭의 효과가 특히 큽니다.**
-
-- Docker는 레이어 단위로 캐시합니다. `Cargo.toml`이 안 바뀌면 이 `RUN`은 **캐시에서 재사용**됩니다.
-- 우리 프로젝트는 의존성이 300개가 넘고 처음 컴파일에 1분 이상 걸립니다. 소스를 한 글자 고칠 때마다 그걸 다시 하면 개발이 불가능합니다.
-- `touch`가 필요한 이유: 더미 빌드의 산출물이 남아 있으면 Cargo가 "이미 최신"이라고 판단합니다. 타임스탬프를 갱신해 재컴파일을 강제합니다.
-
-> `cargo-chef` 크레이트를 쓰면 이 트릭을 더 정확하게 자동화할 수 있습니다. 워크스페이스가 여러 개면 특히 유용합니다.
-
-### 배포 시 체크포인트 5가지
-
-| 항목 | Dockerfile에서 | 왜 |
-|---|---|---|
-| **root로 실행 안 함** | `useradd` + `USER appuser` | 컨테이너 탈출 시 피해 최소화 |
-| **`BIND_ADDR=0.0.0.0:3000`** | `ENV` | `127.0.0.1`로 두면 **컨테이너 밖에서 접속 불가** |
-| **비밀은 이미지에 안 굽는다** | `JWT_SECRET`을 ENV에 **안** 적음 | 이미지 레이어는 누구나 열어볼 수 있음 |
-| **데이터는 볼륨에** | `VOLUME ["/app/data", ...]` | 컨테이너를 지워도 DB가 남아야 함 |
-| **헬스체크** | `HEALTHCHECK` | 오케스트레이터가 재시작 판단을 함 |
-
-**`BIND_ADDR`가 특히 흔한 실수입니다.** 로컬에서 `127.0.0.1`로 잘 돌던 서버가 컨테이너에서는 "연결 거부"가 납니다. 컨테이너 안의 루프백은 호스트와 다른 네임스페이스이기 때문입니다.
-
-**`migrations/` 폴더를 runtime 이미지에 복사하지 않은 것**도 눈여겨보세요. `sqlx::migrate!`가 **컴파일 시점에 SQL을 바이너리에 박아 넣었기** 때문입니다(study5). 실행 파일 하나면 끝입니다.
-
-### `.dockerignore`
+### 3-3. `.dockerignore` — [demo/.dockerignore](demo/.dockerignore)
 
 ```
-target/        ← 이걸 빼지 않으면 빌드 컨텍스트 전송만으로 몇 분이 걸린다
-*.db
-uploads/
-.env
-.git/
+target/          ← 이 한 줄이 가장 중요하다. 수 GB의 빌드 산출물을 빌드 컨텍스트로 보내지 않는다
+*.db  *.db-shm  *.db-wal   uploads/   .env   .git/   *.md
 ```
 
-`target/`은 수 GB입니다. **`.dockerignore`를 빠뜨리면 `docker build`가 시작도 못 하고 몇 분을 씁니다.** Rust 프로젝트에서 가장 중요한 한 줄입니다.
+`target/`을 빼먹으면 `docker build`가 시작도 못 하고 컨텍스트 전송에만 몇 분을 쓴다. `.env`가 이미지에 들어가면 **비밀이 이미지에 구워진다.**
 
-### `compose.yaml`
+### 3-4. ⭐ 종료 신호 — [demo/src/main.rs](demo/src/main.rs)
 
-```yaml
-services:
-  api:
-    build: .
-    image: axum-demo:latest
-    ports:
-      - "3000:3000"
-    environment:
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 환경변수를 설정하세요}
-      RUST_LOG: demo=info,tower_http=info
-    volumes:
-      - api-data:/app/data
-      - api-uploads:/app/uploads
-    restart: unless-stopped
+처음 Docker로 돌려 보니 **`docker stop`이 10.4초**나 걸렸고 종료 로그도 없었다. 앱이 `Ctrl+C`(SIGINT)만 기다리고, Docker가 보내는 **SIGTERM**은 처리하지 않았기 때문이다. 컨테이너의 PID 1은 핸들러가 없는 신호를 무시하므로 Docker가 10초 기다린 뒤 SIGKILL로 죽인다. 진행 중이던 요청이 그대로 끊긴다.
 
-volumes:
-  api-data:
-  api-uploads:
+```rust
+async fn shutdown_signal() {
+    let ctrl_c = async { /* tokio::signal::ctrl_c() */ };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => { sigterm.recv().await; }
+            Err(e) => { tracing::error!(%e, "SIGTERM 핸들러를 등록하지 못했습니다"); std::future::pending::<()>().await; }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();          // Windows에는 SIGTERM이 없다
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("종료 신호(Ctrl+C)를 받았습니다"),
+        _ = terminate => tracing::info!("종료 신호(SIGTERM)를 받았습니다"),
+    }
+}
 ```
 
-`${JWT_SECRET:?메시지}` 문법은 **변수가 없으면 실행을 거부**합니다. "시크릿 설정을 깜빡하고 배포"를 막아줍니다.
+`axum::serve(...).with_graceful_shutdown(shutdown_signal())`가 이 future가 끝나면 **새 연결을 받지 않고 진행 중인 요청을 마친 뒤** 종료한다. 수정 후 실측: `docker stop` **0.4초**, 로그에 `종료 신호(SIGTERM)를 받았습니다` → `서버를 종료했습니다`.
 
-### 실행 명령
+### 3-5. 빌드 · 실행 · 확인 (실측)
 
 ```powershell
-# 빌드
-docker build -t axum-demo:latest .
-
-# 실행 (시크릿은 실행 시점에 주입)
-docker run -d --name axum-demo -p 3000:3000 `
-  -e JWT_SECRET="$([Convert]::ToBase64String((1..48 | % { Get-Random -Max 256 })))" `
-  -v axum-data:/app/data -v axum-uploads:/app/uploads `
-  axum-demo:latest
-
-# 또는 compose
-$env:JWT_SECRET = "..."
-docker compose up -d --build
-
-docker logs -f axum-demo
-docker compose down
+cd demo
+docker build -t axum-demo:study .
+docker images axum-demo:study                 # axum-demo:study   160MB  (바이너리 19MB + debian-slim + curl)
 ```
 
-> ⚠️ **이 문서의 Docker 부분은 실제로 빌드해 보지 못했습니다.** 작업 환경에 Docker CLI는 설치되어 있었지만 Docker Desktop 데몬이 실행 중이 아니라서(`open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified`) 이미지를 만들 수 없었습니다. Dockerfile 자체는 위 설명대로 작성해 두었으니, Docker Desktop을 켠 뒤 `docker build -t axum-demo:latest .`로 직접 확인해 보세요. 다른 문서들의 실행 결과는 전부 실제로 돌려서 얻은 것입니다.
+```powershell
+# 비밀은 실행 시 주입, 데이터는 볼륨
+docker run -d --name axum-demo -p 3200:3000 `
+  -e JWT_SECRET="$(python -c 'import secrets;print(secrets.token_urlsafe(48))')" `
+  -v axumstudy-data:/app/data axum-demo:study
+```
+
+```
+$ curl http://127.0.0.1:3200/health
+{"status":"ok"}
+
+$ docker inspect -f '{{.State.Health.Status}}' axum-demo
+starting  →  (약 30초 뒤)  healthy
+
+$ docker exec axum-demo id
+uid=1000(appuser) gid=1000(appuser) groups=1000(appuser)
+
+# 글을 하나 만들고 → 컨테이너를 지우고 → 같은 볼륨으로 새 컨테이너를 띄운다
+$ curl "http://127.0.0.1:3200/posts"
+posts after recreate: 1 ['in container']                  ← 데이터가 볼륨에 남아 있다
+
+# 비밀키가 짧으면 부팅을 거부한다
+$ docker run --rm -e JWT_SECRET=short axum-demo:study
+Error: JWT_SECRET이 너무 짧습니다 (최소 16자)
+```
+
+> `docker compose up -d --build`(`compose.yaml`)는 위 설정을 파일로 적어 둔 것이다. `JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 환경변수를 설정하세요}` — **설정이 없으면 컨테이너 시작 자체를 거부**한다. `api-data`, `api-uploads` 볼륨이 데이터를 지킨다.
 
 ---
 
-## 8. 처음 만난 오류
+## ④ 🔗 연동 포인트 — 배포 환경에서 환경변수·DB를 잇는 방법
 
-### 8-1. `cannot find attribute 'aliases' in this scope`
-
-```rust
-#[derive(Debug, Serialize, ToSchema)]
-#[aliases(PostPage = Page<crate::posts::model::Post>)]   // ❌ utoipa 5에서 제거됨
-pub struct Page<T> { /* ... */ }
-```
+### 설정이 흘러가는 길
 
 ```
-error: cannot find attribute `aliases` in this scope
-error[E0425]: cannot find type `PostPage` in module `crate::pagination`
+[CI/서버의 시크릿 저장소] ──주입──▶ docker run -e / compose environment / 오케스트레이터 Secret
+                                           │
+                       컨테이너 환경변수 (DATABASE_URL, JWT_SECRET, BIND_ADDR, UPLOAD_DIR, RUST_LOG)
+                                           │ Config::from_env()  — 시작 시 검증
+                                           ▼
+                                      AppState (DB 풀, 비밀키)
 ```
 
-utoipa 4까지의 관용구인데 **5에서 제네릭 스키마를 직접 지원하게 되면서 제거**되었습니다. 등록할 때 구체 타입을 그대로 쓰면 됩니다.
+같은 이미지가 개발·스테이징·운영에 그대로 가고, **달라지는 것은 주입하는 값뿐**이다.
 
-```rust
-components(schemas(crate::pagination::Page<crate::posts::model::Post>))
+### 배포 환경에서 DB를 잇는 세 가지
+
+| 방식 | 구성 | 언제 |
+|---|---|---|
+| **① 볼륨 위 SQLite** | `-v data:/app/data`, `DATABASE_URL=sqlite:///app/data/data.db?mode=rwc` | 작은 서비스, 서버 1대. **인스턴스를 둘 이상 띄우면 안 된다** |
+| **② 같은 compose의 PostgreSQL 컨테이너** | 앱 이미지를 `--build-arg CARGO_FLAGS="--no-default-features --features postgres"`로 빌드, `DATABASE_URL=postgres://postgres:…@db:5432/board` (서비스 이름 `db`가 호스트명) | 한 서버에서 앱+DB |
+| **③ 관리형 DB** (클라우드 PostgreSQL) | `DATABASE_URL`만 교체. 보통 `?sslmode=require` | 여러 인스턴스, 백업·장애 복구를 맡기고 싶을 때 |
+
+컨테이너끼리는 **서비스 이름으로** 서로를 찾는다(`db`). 앱에서 `localhost`는 **자기 자신 컨테이너**다.
+
+실측(②): PostgreSQL 이미지(`axum-demo:pg`, 158MB)를 `compose.postgres.yaml`의 DB와 **같은 Docker 네트워크**에 띄워 `DATABASE_URL=postgres://postgres:postgres@db:5432/board`로 연결했다. 가입 → 로그인 → 글 작성(201) → 검색까지 동작했고, 마이그레이션(`migrations_pg/`)은 앱이 시작할 때 자동 적용됐으며 `docker stop`은 0.4초였다.
+
+### 마이그레이션은 앱이 시작할 때 자동 실행
+
+`db::init()`이 `sqlx::migrate!`를 실행한다. 이미 적용된 것은 건너뛴다. **여러 인스턴스가 동시에 뜨면** 경합할 수 있어서(sqlx는 락으로 보호하지만) 큰 서비스는 마이그레이션을 **별도 단계**(배포 전 1회)로 분리한다.
+
+### 배포 후 점검표
+
+배포했다면 위에서 아래로 확인한다.
+
 ```
-
-> 확인 방법: 크레이트 소스가 `~/.cargo/registry/src/...`에 그대로 있으니 `grep -rn "aliases" utoipa-gen-5.5.0/src/lib.rs` 로 존재 여부를 바로 확인할 수 있었습니다. **Rust는 의존성 소스가 로컬에 다 있어서 이런 확인이 빠릅니다.**
-
-### 8-2. `ToSchema`와 `IntoParams`를 혼동
-
-쿼리 파라미터 구조체에 `ToSchema`만 붙이고 `params(PageQuery)`를 쓰면 컴파일 에러가 납니다. **본문 스키마는 `ToSchema`, 쿼리/경로 파라미터는 `IntoParams`** 입니다.
-
-### 8-3. `path`가 실제 라우트와 어긋남
-
-```rust
-// 라우터: .nest("/posts", ...) 안의 .route("/{id}", ...)
-#[utoipa::path(get, path = "/{id}", ...)]   // ❌ 문서에는 /{id}로 나감
-#[utoipa::path(get, path = "/posts/{id}", ...)]  // ✅
+□ 1. 프로세스      docker ps 에서 Up, 재시작 반복(restarting) 아님
+□ 2. 헬스체크      curl -fsS https://도메인/health → {"status":"ok"} / docker inspect → healthy
+□ 3. 로그          docker logs 에 ERROR·panic 없음. "database ready", "listening" 확인. 비밀번호·토큰이 로그에 없다
+□ 4. 설정          기본 JWT_SECRET 경고(WARN)가 없다. BIND_ADDR=0.0.0.0, RUST_LOG=info
+□ 5. HTTPS         http:// 접속 시 https://로 이동. 인증서 유효기간 확인
+□ 6. 핵심 시나리오  가입 → 로그인 → 글 작성 → 목록 → 수정 → 삭제 (curl 또는 Swagger UI)
+□ 7. 인증/인가     토큰 없이 글쓰기 401, 남의 글 수정 403
+□ 8. 오류 모양     없는 경로 404, 잘못된 입력 400이 { error: { code, message, requestId } } 인지
+□ 9. 데이터 유지   컨테이너 재생성 후에도 글이 남는다 (볼륨/DB)
+□ 10. 정상 종료    docker stop 이 1초 안팎, 로그에 "종료 신호(SIGTERM)"
+□ 11. 비root       docker exec <컨테이너> id → appuser
+□ 12. CORS         허용 출처가 운영 프론트 주소로 설정되어 있다 (개발용 localhost 아님)
+□ 13. 백업         DB 파일/볼륨 백업이 실제로 되고 복원해 봤다 (study16)
+□ 14. 롤백 경로    직전 이미지 태그를 알고 있다 (latest만 쓰지 않는다)
 ```
-
-**컴파일 에러가 안 납니다.** 문서만 조용히 틀립니다. `utoipa-axum`의 `OpenApiRouter`를 쓰면 라우터 등록과 문서를 한 번에 처리해 이 문제를 줄일 수 있습니다.
 
 ---
 
-## 9. 이번 study 정리
+## ⑤ 오류 노트
 
-- **Rust에는 런타임 리플렉션이 없어서 문서 자동화가 공짜가 아니다.** `#[utoipa::path]`를 직접 쓴다. 대신 통제력이 높다.
-- `ToSchema`(본문) / `IntoParams`(쿼리·경로)를 구분한다. utoipa 5는 **제네릭 스키마를 그대로 지원**한다(`#[aliases]`는 제거됨).
-- `Modify`로 보안 스킴을 추가해야 Swagger UI에 **Authorize** 버튼이 생긴다.
-- **`ToSchema`를 안 붙이면 문서에도 안 나간다.** `UserRow`가 그 예 — 타입 설계가 곧 노출 통제다.
-- 릴리스 빌드는 `lto` + `codegen-units=1` + `strip`. **`panic = "abort"`는 `CatchPanicLayer`를 무력화하므로 쓰지 않는다.**
-- Docker는 **멀티 스테이지**로. 빌드 스테이지 수 GB → 런타임 이미지 ~100MB.
-- **Rust에서는 의존성 레이어 캐싱 트릭이 필수**다. 없으면 소스 한 줄 고칠 때마다 전체 재컴파일.
-- `.dockerignore`에 **`target/`**. 이거 하나로 빌드 시작 속도가 갈린다.
-- 컨테이너에서는 **`BIND_ADDR=0.0.0.0`**, 실행은 **비root**, 비밀은 **이미지에 굽지 않기**, 데이터는 **볼륨**.
-- `sqlx::migrate!` 덕분에 **마이그레이션 폴더를 이미지에 넣지 않아도 된다.**
+| 증상 | 원인 | 해결 |
+|---|---|---|
+| `docker build` 중 `failed to run custom build command for utoipa-swagger-ui` — `trying to download using curl system package` | 그 크레이트의 `build.rs`가 **빌드 중에 GitHub에서 Swagger UI zip을 curl로 내려받는다.** slim 빌더 이미지에는 curl이 없고, 오프라인 CI에서는 네트워크도 없다 | `utoipa-swagger-ui = { features = ["axum", "vendored"] }` — 정적 파일을 크레이트에 포함해 **빌드가 네트워크에 의존하지 않게** 한다. (로컬에서는 curl·네트워크가 있어서 문제를 못 봤다) |
+| `docker stop`이 10초 걸리고 강제 종료됨 | SIGTERM을 처리하지 않음 (PID 1은 핸들러 없는 신호를 무시) | `shutdown_signal`에서 SIGTERM 처리 |
+| 컨테이너에서 실행했는데 밖에서 접속이 안 됨 | `BIND_ADDR=127.0.0.1` | `0.0.0.0:3000` |
+| 컨테이너를 지웠더니 DB가 사라짐 | 볼륨을 마운트하지 않음 | `-v 이름:/app/data` |
+| 컨테이너가 계속 재시작 (`Restarting`) | 부팅 중 오류 (짧은 `JWT_SECRET`, DB 연결 실패 등) | `docker logs`로 이유 확인. 시작 시 검증이 이 경우 **즉시, 명확하게** 실패하게 해 준다 |
+| `permission denied` (볼륨 쓰기) | `appuser`가 볼륨 소유자가 아님 | Dockerfile에서 `chown`, 호스트 디렉터리를 마운트할 땐 권한 확인 |
+| 소스를 한 줄 고쳤는데 의존성 전체를 다시 컴파일 | 의존성 캐싱 트릭이 깨짐 (`COPY . .`를 먼저 했거나 `Cargo.lock` 미포함) | `Cargo.toml`/`Cargo.lock`만 먼저 복사 → 가짜 빌드 → 소스 복사 |
+| 이미지에 가짜 `fn main() {}`이 들어감 (실행하면 아무 일도 안 함) | `touch`를 빠뜨려 두 번째 빌드가 캐시된 가짜 결과를 씀 | `touch src/main.rs src/lib.rs` |
+| `docker build`가 시작도 안 하고 몇 분 걸림 | `.dockerignore`에 `target/`이 없어 수 GB를 전송 | `.dockerignore`의 `target/` |
+| 브라우저에서 HTTPS인데 로그인 쿠키가 안 붙음 | 프록시 뒤라 앱이 `http`로 인식해 `Secure` 판단이 어긋나거나, 반대로 `Secure` 쿠키를 http로 접속 | `SECURE_COOKIE` 환경변수로 명시 (study7) |
+| 시작 로그에 **DB 비밀번호가 그대로** 찍힘 (`database_url=postgres://postgres:postgres@db…`) | `DATABASE_URL`을 그대로 `tracing`에 출력 | `Config::redacted_database_url()`로 비밀번호를 `***`로 가려 출력 (단위 테스트 포함). 비밀 값은 **로그에도 남기지 않는다** |
+| 이미지가 예상(~100MB)보다 큼 (실측 160MB) | `debian:bookworm-slim`(~75MB) + `curl` + 바이너리(19MB) | 더 줄이려면 헬스체크를 앱 서브커맨드로 대체해 `curl` 제거, 또는 `distroless`/`alpine`(musl 타깃 필요) |
 
-다음: [studyFinal.md](studyFinal.md) — 지금까지 배운 것을 **구조를 바꿔서** 다시 조립한 최종 프로젝트.
+---
+
+## ⑥ 직접 해보기
+
+1. **이미지 빌드 시간 비교**: `src/routes.rs`의 응답 문자열 한 줄을 바꾸고 `docker build`를 다시 돌려 **의존성 레이어가 캐시되는지**(`CACHED`) 확인한다. 이어서 `Cargo.toml`에 의존성을 하나 추가했을 때 어떻게 달라지는지 본다.
+2. **PostgreSQL 이미지**: `docker build --build-arg CARGO_FLAGS="--no-default-features --features postgres" -t axum-demo:pg .` 후 `compose.postgres.yaml`의 DB 컨테이너와 **같은 네트워크**에서 `DATABASE_URL=postgres://postgres:postgres@db:5432/board`로 실행하고 점검표 6번 시나리오를 돌린다 (study11).
+3. **점검표 스크립트화**: 위 점검표 2·6·7·8번을 `curl`과 `jq`/`python`으로 자동 실행하는 `smoke.sh`를 만든다. 실패하면 종료 코드가 0이 아니게 한다 — study16의 CI/CD에서 그대로 쓴다.
+
+---
+
+## ⑦ ☐ 체크리스트
+
+- ☐ `debug`/`release` 빌드의 차이와 `[profile.release]`의 각 항목, `panic = "abort"`를 켜면 안 되는 이유를 설명할 수 있다
+- ☐ 멀티 스테이지 빌드가 왜 필요한지(빌드 수 GB → 실행 이미지)를 설명할 수 있다
+- ☐ 의존성 레이어 캐싱 트릭(가짜 소스 → 의존성 컴파일 → 진짜 소스)과 `touch`가 필요한 이유를 설명할 수 있다
+- ☐ `.dockerignore`의 `target/`, `.env`가 중요한 이유를 안다
+- ☐ 컨테이너에서 `BIND_ADDR=0.0.0.0`, 비root 실행, 비밀 주입, 볼륨 마운트가 각각 왜 필요한지 설명할 수 있다
+- ☐ `docker stop`이 SIGTERM을 받아 **빠르게 정상 종료**하는 것을 직접 확인했다
+- ☐ 도메인 → DNS → 리버스 프록시(HTTPS 종료) → 앱의 흐름을 그릴 수 있다
+- ☐ 컨테이너를 지웠다 다시 띄워도 데이터가 남는 것을 직접 확인했다
+- ☐ 배포 후 점검표 14개를 순서대로 말할 수 있다
+
+---
+
+## 기초 구간(study0~10) 총정리
+
+| 단계 | 핵심 | 대표 산출물 |
+|---|---|---|
+| study0 환경 | rustup · cargo · rust-analyzer · `.env`/`.gitignore` | `hello-axum` |
+| study1 Hello World | 핸들러 = `async fn`, `IntoResponse`, `{name}` 경로, 이스케이프 | `s01_hello` |
+| study2 구조 | 핸들러 → Router → 모듈, `State`, `with_state` | `s02_modules` |
+| study3 데이터 | `Arc<RwLock<…>>`, 파일 저장(임시 파일 + rename), 바인딩 | `s03_store` |
+| study4 라우팅 | 경로/쿼리, 404/405, 미들웨어 흐름, CORS | `s04_routing` |
+| study5 폼·검증 | `validator`, `ValidatedJson`, 상태 코드별 화면, `Idempotency-Key` | `s05_form` |
+| study6 DB·API | sqlx · 마이그레이션 · CRUD · 스펙 v1 오류 본문/camelCase · 환경변수 | `demo/` |
+| study7 인증·보안 | Argon2 · JWT · `AuthUser` · 401/403 · CORS/XSS/CSRF | `demo/auth` |
+| study8 구조화 | lib+bin · 공통 모듈 · `Config` · 미들웨어 순서 | `demo/lib.rs` |
+| study9 테스트 | 단위 · `oneshot` · mock · 디버깅 · 오류 TOP 10 | `demo/tests`, `lab/mock_demo` |
+| study10 배포 | 릴리스 · 멀티 스테이지 Docker · HTTPS · 점검표 | `Dockerfile` |
+
+**기초 구간에서 얻은 원칙 일곱 가지**
+
+1. **핸들러는 함수, 라우터는 값.** 애노테이션도 컨테이너도 없다. 시그니처가 곧 계약이다.
+2. **Extractor가 전부다.** 파싱·검증·인증이 인자 타입으로 표현되고, 실패하면 핸들러는 호출되지 않는다.
+3. **오류는 값이다.** `Result<T, AppError>` + `IntoResponse`로 한 곳에서 HTTP로 번역하고, 새 갈래는 컴파일러가 누락을 알려 준다.
+4. **인증(401)과 인가(403)는 다른 문제.** 인가는 DB를 읽어야 해서 extractor가 아니라 핸들러/서비스의 몫이다.
+5. **미들웨어는 순서가 전부다.** 전체에 적용할 것은 바깥, 조건부는 안쪽.
+6. **버전부터 확인한다.** 오류의 절반은 버전 차이였다 (axum 0.8 `{id}`, jsonwebtoken 11 `rust_crypto`, sqlx 0.9 `SqlSafeStr`, argon2 0.6).
+7. **직접 돌려 본 것만 믿는다.** Docker 빌드를 돌려서야 `curl` 의존, SIGTERM 미처리가 드러났다.
+
+---
+
+## ⑧ 다음 단계 연결
+
+기초 구간이 끝났다. [studyMidpoint](studyMidpoint.md)에서는 study0~10에서 배운 것**만으로** 게시판 + 로그인 + CRUD 서비스를 처음부터 끝까지 조립하는 순서를 문서로 정리하고, 1차 배포 체크리스트와 회고로 중간 점검을 한다.

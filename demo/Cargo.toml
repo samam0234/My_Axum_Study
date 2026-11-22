@@ -13,7 +13,8 @@ dotenvy = "0.15.7"
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "macros", "migrate"] }
+# DB 드라이버(sqlite/postgres)는 아래 [features]에서 고른다.
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "chrono", "macros", "migrate"] }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs", "signal"] }
 tower = { version = "0.5.3", features = ["util", "timeout"] }
@@ -21,9 +22,17 @@ tower-http = { version = "0.7.1", features = ["trace", "cors", "compression-gzip
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 utoipa = { version = "5.5.0", features = ["axum_extras", "chrono"] }
-utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+# vendored: Swagger UI 정적 파일을 크레이트에 포함해 쓴다. 이게 없으면 build.rs가 **빌드 중에**
+# GitHub에서 zip을 curl로 내려받아서, curl이 없는 Docker 빌드 이미지나 오프라인 CI에서 실패한다. (study10)
+utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"] }
 uuid = { version = "1.26.1", features = ["v4"] }
 validator = { version = "0.21.0", features = ["derive"] }
+
+[features]
+default = ["sqlite"]
+sqlite = ["sqlx/sqlite"]
+# 사용: cargo run --no-default-features --features postgres
+postgres = ["sqlx/postgres"]
 
 [dev-dependencies]
 http-body-util = "0.1.5"

@@ -17,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(?config.bind_addr, "설정을 불러왔습니다");
 
     let pool = db::init(&config.database_url).await?;
-    tracing::info!(database_url = %config.database_url, "database ready");
+    tracing::info!(database_url = %config.redacted_database_url(), "database ready");
 
     upload::ensure_dir(&config.upload_dir).await?;
 
@@ -37,9 +37,39 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 종료 신호를 기다린다.
+///
+/// - **Ctrl+C (SIGINT)**: 로컬 개발
+/// - **SIGTERM**: `docker stop`, 쿠버네티스, systemd가 보내는 "정상 종료해 달라"는 신호
+///
+/// SIGTERM을 처리하지 않으면 컨테이너의 PID 1은 신호를 무시해서, `docker stop`이
+/// **10초를 기다린 뒤 SIGKILL**로 죽인다. 진행 중이던 요청이 끊기고 배포가 느려진다. (study10)
 async fn shutdown_signal() {
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => tracing::info!("종료 신호를 받았습니다"),
-        Err(e) => tracing::error!(%e, "종료 신호를 기다리지 못했습니다"),
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(%e, "Ctrl+C 신호를 기다리지 못했습니다");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(%e, "SIGTERM 핸들러를 등록하지 못했습니다");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    // Windows에는 SIGTERM이 없다. 영원히 끝나지 않는 future로 채워 둔다.
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("종료 신호(Ctrl+C)를 받았습니다"),
+        _ = terminate => tracing::info!("종료 신호(SIGTERM)를 받았습니다"),
     }
 }

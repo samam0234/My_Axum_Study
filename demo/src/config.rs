@@ -6,6 +6,12 @@
 
 use anyhow::Context;
 
+/// DB를 지정하지 않았을 때의 기본값. 빌드한 feature에 따라 달라진다.
+#[cfg(feature = "sqlite")]
+const DEFAULT_DATABASE_URL: &str = "sqlite://data.db?mode=rwc";
+#[cfg(feature = "postgres")]
+const DEFAULT_DATABASE_URL: &str = "postgres://postgres:postgres@localhost:5432/board";
+
 /// 기본 JWT 시크릿. 운영에서 이 값이 쓰이면 경고를 띄운다.
 const DEV_JWT_SECRET: &str = "dev-only-insecure-secret-change-me";
 
@@ -23,7 +29,7 @@ impl Config {
     /// 우선순위: **실제 환경변수 > .env 파일 > 기본값**
     pub fn from_env() -> anyhow::Result<Self> {
         let config = Self {
-            database_url: env_or("DATABASE_URL", "sqlite://data.db?mode=rwc"),
+            database_url: env_or("DATABASE_URL", DEFAULT_DATABASE_URL),
             jwt_secret: env_or("JWT_SECRET", DEV_JWT_SECRET),
             bind_addr: env_or("BIND_ADDR", "127.0.0.1:3000"),
             upload_dir: env_or("UPLOAD_DIR", "uploads"),
@@ -33,14 +39,26 @@ impl Config {
         Ok(config)
     }
 
-    /// 테스트용 설정 — in-memory DB.
+    /// 테스트용 설정 — SQLite는 in-memory DB, PostgreSQL은 `TEST_DATABASE_URL`.
     pub fn for_test() -> Self {
+        #[cfg(feature = "sqlite")]
+        let database_url = "sqlite::memory:".to_string();
+        #[cfg(feature = "postgres")]
+        let database_url = env_or("TEST_DATABASE_URL", DEFAULT_DATABASE_URL);
+
         Self {
-            database_url: "sqlite::memory:".to_string(),
+            database_url,
             jwt_secret: "test-secret-test-secret-test-secret".to_string(),
             bind_addr: "127.0.0.1:0".to_string(),
             upload_dir: "uploads".to_string(),
         }
+    }
+
+    /// 로그에 찍어도 되는 DB 주소. `postgres://user:비밀번호@host/db`의 **비밀번호를 가린다.**
+    ///
+    /// 시작 로그에 `DATABASE_URL`을 그대로 찍으면 비밀번호가 로그 수집 시스템에 남는다.
+    pub fn redacted_database_url(&self) -> String {
+        redact_url_password(&self.database_url)
     }
 
     /// 시작 시점에 잘못된 설정을 잡는다. **서버가 뜬 뒤에 발견하는 것보다 낫다.**
@@ -78,4 +96,48 @@ pub fn load_dotenv() -> anyhow::Result<()> {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// `scheme://user:password@host/...` 의 password를 `***`로 바꾼다. 비밀번호가 없으면 그대로 둔다.
+fn redact_url_password(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let (scheme, rest) = url.split_at(scheme_end + 3);
+
+    // 사용자 정보는 첫 '/' 앞에 있고 마지막 '@'로 끝난다 (비밀번호에 '@'가 들어 있을 수 있다)
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let Some(at) = rest[..authority_end].rfind('@') else {
+        return url.to_string();
+    };
+    let userinfo = &rest[..at];
+    match userinfo.split_once(':') {
+        Some((user, _password)) => format!("{scheme}{user}:***{}", &rest[at..]),
+        None => url.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_url_password;
+
+    #[test]
+    fn 비밀번호만_가린다() {
+        assert_eq!(
+            redact_url_password("postgres://postgres:s3cret@db:5432/board"),
+            "postgres://postgres:***@db:5432/board"
+        );
+        // 비밀번호에 '@'가 들어 있어도 호스트 앞의 마지막 '@'를 기준으로 가린다
+        assert_eq!(
+            redact_url_password("postgres://u:p@ss@db/board"),
+            "postgres://u:***@db/board"
+        );
+    }
+
+    #[test]
+    fn 비밀번호가_없으면_그대로_둔다() {
+        assert_eq!(redact_url_password("sqlite://data.db?mode=rwc"), "sqlite://data.db?mode=rwc");
+        assert_eq!(redact_url_password("postgres://db:5432/board"), "postgres://db:5432/board");
+        assert_eq!(redact_url_password("sqlite::memory:"), "sqlite::memory:");
+    }
 }
