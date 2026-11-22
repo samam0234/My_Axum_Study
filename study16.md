@@ -481,20 +481,20 @@ jobs:
 demo     $ cargo test                                                      → 단위 12 + 통합 31 통과
 demo     $ cargo check --no-default-features --features postgres           → Finished
 project  $ cargo test --workspace                                          → domain 서비스 8 + 유틸 1, web 단위 6 + HTTP 20 통과 (SQLite·PostgreSQL·MySQL 드라이버 포함)
-lab      $ cargo test --lib --examples                                     → mock 3 + 서명 3 + 프롬프트/스트림 3 통과
+lab      $ cargo test --lib --examples                                     → 31개 통과 (예제별 시험 + mock 3, s16의 WAL 백업 시험 포함)
 워크플로 YAML                                                               → 문법 검증 통과 (jobs: demo, project, lab / publish)
 ```
 
-**GitHub Actions 실제 실행 결과** — 첫 실행(커밋 `50acec1` 푸시 직후)은 세 job 모두 **success**였고, 이후 스펙 v1 정렬 커밋(`1349aed` demo, `b511e9d` project)을 푸시했을 때도 `ci`가 모두 **success**였다. 마지막 실행(`b511e9d`)의 job별 결과:
+**GitHub Actions 실제 실행 결과** — 첫 실행(커밋 `50acec1` 푸시 직후)은 세 job 모두 **success**였고, 이후 스펙 v1 정렬(`1349aed` demo, `b511e9d` project)과 단계 예제 추가(`s06~s10`, `s16`)를 푸시했을 때도 `ci`가 모두 **success**였다. 마지막 실행(`a03e8aa`)의 job별 결과:
 
 ```
-ci  completed success   (커밋 b511e9d)
-  demo     (sqlite 테스트 + postgres 빌드)   success  47초   ← Ubuntu에서 cargo test(단위 12 + 통합 31) + PostgreSQL feature 컴파일
-  project  (워크스페이스 테스트)              success  42초   ← domain 서비스 8 + web HTTP 20 + 단위 7
-  lab      (예제 컴파일 + 테스트)             success  13초   ← mongodb·reqwest·ws 포함 전 예제 컴파일, 단위 테스트 9
+ci  completed success   (커밋 a03e8aa)
+  demo     (sqlite 테스트 + postgres 빌드)   success  30초   ← Ubuntu에서 cargo test(단위 12 + 통합 31) + PostgreSQL feature 컴파일
+  project  (워크스페이스 테스트)              success  30초   ← domain 서비스 8 + web HTTP 20 + 단위 7
+  lab      (예제 컴파일 + 테스트)             success  99초   ← sqlx·mongodb·reqwest·ws 포함 전 예제 컴파일 + 시험 31개 (s10의 종료 시험, s16의 WAL 백업 시험 포함)
 ```
 
-첫 실행보다 훨씬 빠른 것은 `Swatinem/rust-cache`가 `target/`과 레지스트리를 캐시했기 때문이다. 의존성이 그대로이고 내 코드만 바뀌면 컴파일이 수십 초로 줄어든다.
+lab이 99초로 가장 오래 걸리는 것은 새로 들어온 `sqlx`(SQLite 번들)·`argon2` 등을 처음 컴파일했기 때문이다. `Swatinem/rust-cache`가 `target/`과 레지스트리를 캐시하므로 의존성이 그대로면 다음 실행부터 수십 초로 줄어든다. 첫 실행보다 demo·project가 빨라진 것도 같은 이유다.
 
 로컬(Windows)에서 통과한 것이 CI(Ubuntu)에서도 통과했다 — 경로 구분자·줄바꿈·설치된 도구에 의존하는 시험이 없다는 확인이기도 하다.
 
