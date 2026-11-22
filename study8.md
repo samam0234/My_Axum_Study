@@ -4,7 +4,7 @@
 
 | 항목 | 내용 |
 |---|---|
-| 관련 코드 | [demo/src/lib.rs](demo/src/lib.rs), [demo/src/main.rs](demo/src/main.rs), [demo/src/config.rs](demo/src/config.rs), [demo/src/extract.rs](demo/src/extract.rs), [demo/src/middleware.rs](demo/src/middleware.rs), [demo/src/state.rs](demo/src/state.rs) |
+| 관련 코드 | 단계 예제 [lab/examples/s08_structure.rs](lab/examples/s08_structure.rs)(포트 3008), 실제 프로젝트: [demo/src/lib.rs](demo/src/lib.rs), [demo/src/main.rs](demo/src/main.rs), [demo/src/config.rs](demo/src/config.rs), [demo/src/extract.rs](demo/src/extract.rs), [demo/src/middleware.rs](demo/src/middleware.rs), [demo/src/state.rs](demo/src/state.rs) |
 
 ---
 
@@ -65,6 +65,285 @@ tests/api.rs  ← lib을 외부 사용자처럼 가져다 쓴다
 ---
 
 ## ③ 🛠️ 실기
+
+### 3-0. 단계 예제 — [lab/examples/s08_structure.rs](lab/examples/s08_structure.rs) (포트 3008)
+
+구조화의 핵심을 한 파일에 담았다. 폴더 대신 **인라인 모듈**(`config` · `error` · `middleware` · `routes`)로 경계를 보이고, `Config`를 한 곳에서 읽어 시작할 때 검증하고, **미들웨어 순서 버그를 환경변수 하나로 재현·복구**한다. 실제 프로젝트에서는 각 모듈이 파일이 된다(`demo/src/config.rs`, `error.rs`, `middleware.rs`).
+
+```powershell
+cd lab
+cargo run --example s08_structure                                    # 올바른 순서
+$env:LAYER_ORDER = "wrong"; cargo run --example s08_structure        # 요청 ID 계층을 맨 안쪽에 둔 잘못된 순서
+$env:JWT_SECRET = "short"; cargo run --example s08_structure         # 짧은 비밀키 → 부팅 거부
+cargo test --example s08_structure                                   # 시험 3개
+```
+
+```rust
+//! study8 — 구조화 · 재사용. 포트 3008.
+//!
+//! 한 단계에서 배우는 것만 담았다: 폴더 대신 **인라인 모듈**로 보는 경계(config / error / middleware / routes),
+//! `Config`를 한 곳에서 읽고 **시작할 때 검증**, 미들웨어 **순서**(요청 ID가 패닉·타임아웃 응답에서 사라지는 버그를
+//! 환경변수 하나로 재현·복구), `lib + bin`처럼 `app()`을 따로 두기.
+//!
+//! 실행:  cargo run --example s08_structure                          # 올바른 순서
+//!        LAYER_ORDER=wrong cargo run --example s08_structure         # 요청 ID 계층을 맨 안쪽에 둔 잘못된 순서
+//!        JWT_SECRET=short cargo run --example s08_structure          # 짧은 비밀키 → 부팅 거부
+
+use axum::{Router, extract::DefaultBodyLimit, routing::get};
+use tower_http::{
+    catch_panic::CatchPanicLayer,
+    compression::CompressionLayer,
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    timeout::TimeoutLayer,
+};
+
+// ───────────────────────────────────────────────────────────────────────────
+// config — 설정은 한 곳에서, 시작할 때 한 번에 읽고 검증한다
+// ───────────────────────────────────────────────────────────────────────────
+mod config {
+    const DEV_JWT_SECRET: &str = "dev-only-insecure-secret-change-me";
+
+    #[derive(Debug, Clone)]
+    pub struct Config {
+        pub bind_addr: String,
+        pub jwt_secret: String,
+        pub request_timeout_secs: u64,
+        pub wrong_order: bool,
+    }
+
+    impl Config {
+        /// 우선순위: 실제 환경변수 > 기본값. (`.env`는 dotenvy가 먼저 환경변수로 올려 준다 — demo/)
+        pub fn from_env() -> anyhow::Result<Self> {
+            let config = Self {
+                bind_addr: env_or("BIND_ADDR", "127.0.0.1:3008"),
+                jwt_secret: env_or("JWT_SECRET", DEV_JWT_SECRET),
+                request_timeout_secs: env_or("REQUEST_TIMEOUT_SECS", "2").parse()?,
+                wrong_order: env_or("LAYER_ORDER", "right") == "wrong",
+            };
+            config.validate()?;
+            Ok(config)
+        }
+
+        /// 시작 시점에 잘못된 설정을 잡는다. 서버가 뜬 뒤에 발견하는 것보다 낫다.
+        pub fn validate(&self) -> anyhow::Result<()> {
+            if self.jwt_secret.len() < 16 {
+                anyhow::bail!("JWT_SECRET이 너무 짧습니다 (최소 16자)");
+            }
+            if self.jwt_secret == DEV_JWT_SECRET {
+                eprintln!("WARN 기본 JWT_SECRET을 쓰고 있습니다. 운영에서는 반드시 설정하세요.");
+            }
+            Ok(())
+        }
+
+        /// 시험 전용 설정 — 일반 빌드에는 포함되지 않는다.
+        #[cfg(test)]
+        pub fn for_test() -> Self {
+            Self { bind_addr: "127.0.0.1:0".into(), jwt_secret: "test-secret-test-secret".into(), request_timeout_secs: 1, wrong_order: false }
+        }
+    }
+
+    fn env_or(key: &str, default: &str) -> String {
+        std::env::var(key).unwrap_or_else(|_| default.to_string())
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// error — 모든 오류 응답이 같은 모양. 핸들러는 `?`만 쓴다
+// ───────────────────────────────────────────────────────────────────────────
+mod error {
+    use axum::{Json, http::StatusCode, response::{IntoResponse, Response}};
+    use serde_json::json;
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum AppError {
+        #[error(transparent)]
+        Internal(#[from] anyhow::Error),
+    }
+    pub type AppResult<T> = Result<T, AppError>;
+
+    impl IntoResponse for AppError {
+        fn into_response(self) -> Response {
+            let Self::Internal(e) = &self;
+            eprintln!("internal error: {e:?}"); // 원인은 로그에만, 응답은 고정 문구
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": { "code": "INTERNAL", "message": "서버 내부 오류가 발생했습니다." } }))).into_response()
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// middleware — 오류 본문에 requestId를 채우고, 우리 코드를 거치지 않은 4xx·5xx도 같은 모양으로
+// ───────────────────────────────────────────────────────────────────────────
+mod middleware {
+    use axum::{
+        body::{Body, to_bytes},
+        extract::Request,
+        http::{HeaderName, HeaderValue, StatusCode, header},
+        middleware::Next,
+        response::{IntoResponse, Response},
+    };
+    use serde_json::{Value, json};
+
+    pub const REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
+
+    /// 핸들러는 요청 헤더를 모르므로 응답이 나가는 길목에서 requestId를 채운다.
+    pub async fn error_envelope(request: Request, next: Next) -> Response {
+        let request_id = request.headers().get(&REQUEST_ID).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let response = next.run(request).await;
+        let status = response.status();
+        if !(status.is_client_error() || status.is_server_error()) {
+            return response; // 성공 응답은 건드리지 않는다
+        }
+        let (mut parts, body) = response.into_parts();
+        let bytes = to_bytes(body, 64 * 1024).await.unwrap_or_default();
+        let mut value: Value = serde_json::from_slice(&bytes)
+            .ok()
+            .filter(|v: &Value| v.get("error").is_some_and(Value::is_object)) // 이미 { error: {..} } 이면 그대로
+            .unwrap_or_else(|| json!({ "error": { "code": code_for(status), "message": status.canonical_reason().unwrap_or("error") } })); // 빈 본문(408 등)은 새로 감싼다
+        if let (Some(id), Some(error)) = (request_id, value.get_mut("error")) {
+            error["requestId"] = Value::String(id);
+        }
+        parts.headers.remove(header::CONTENT_LENGTH); // 본문이 바뀌었으니 길이를 다시 계산하게
+        parts.headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        Response::from_parts(parts, Body::from(value.to_string()))
+    }
+
+    fn code_for(status: StatusCode) -> &'static str {
+        match status {
+            StatusCode::NOT_FOUND => "NOT_FOUND",
+            StatusCode::REQUEST_TIMEOUT => "REQUEST_TIMEOUT",
+            StatusCode::PAYLOAD_TOO_LARGE => "PAYLOAD_TOO_LARGE",
+            s if s.is_client_error() => "BAD_REQUEST",
+            _ => "INTERNAL",
+        }
+    }
+
+    /// 패닉을 연결 끊김이 아니라 500 JSON으로.
+    pub fn on_panic(_: Box<dyn std::any::Any + Send + 'static>) -> Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({ "error": { "code": "INTERNAL", "message": "서버 내부 오류가 발생했습니다." } }))).into_response()
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// routes — 핸들러는 얇게
+// ───────────────────────────────────────────────────────────────────────────
+mod routes {
+    use super::error::{AppError, AppResult};
+    use std::time::Duration;
+
+    pub async fn health() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({ "status": "ok" }))
+    }
+    pub async fn boom() -> AppResult<&'static str> {
+        let _n: i32 = "not-a-number".parse::<i32>().map_err(|e| AppError::Internal(anyhow::anyhow!("설정 값 파싱 실패: {e}")))?;
+        Ok("unreachable")
+    }
+    pub async fn panic_handler() -> &'static str {
+        panic!("의도적으로 터뜨린 패닉");
+    }
+    pub async fn slow() -> &'static str {
+        tokio::time::sleep(Duration::from_secs(10)).await; // TimeoutLayer보다 오래 걸린다
+        "도달하지 못한다"
+    }
+}
+
+/// 라우터 조립. main과 테스트가 **같은 함수**를 쓴다 (lib + bin 구조의 이유).
+///
+/// `.layer()`를 연달아 부르면 **나중에 붙인 것이 바깥**이다. (ServiceBuilder는 위가 바깥)
+fn app(config: &config::Config) -> Router {
+    let routes = Router::new()
+        .route("/health", get(routes::health))
+        .route("/boom", get(routes::boom))
+        .route("/panic", get(routes::panic_handler))
+        .route("/slow", get(routes::slow));
+
+    let timeout = TimeoutLayer::with_status_code(axum::http::StatusCode::REQUEST_TIMEOUT, std::time::Duration::from_secs(config.request_timeout_secs));
+    let propagate = PropagateRequestIdLayer::new(middleware::REQUEST_ID);
+    let set_id = SetRequestIdLayer::new(middleware::REQUEST_ID, MakeRequestUuid);
+
+    if config.wrong_order {
+        // ❌ Propagate가 맨 안쪽. CatchPanic·Timeout은 아래 계층의 응답을 버리고 **자기가 새 응답을 만들기** 때문에
+        //    그 새 응답은 Propagate를 거치지 않는다 → 패닉·타임아웃 응답에만 x-request-id가 빠진다
+        routes
+            .layer(propagate)
+            .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+            .layer(timeout)
+            .layer(CatchPanicLayer::custom(middleware::on_panic))
+            .layer(axum::middleware::from_fn(middleware::error_envelope))
+            .layer(CompressionLayer::new())
+            .layer(set_id)
+    } else {
+        // ✅ 안쪽 → 바깥 순서로 적는다.
+        routes
+            .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 10. 가장 안쪽: 본문 크기 제한
+            .layer(timeout) //                                8. 5초 넘는 요청을 408로
+            .layer(CatchPanicLayer::custom(middleware::on_panic)) // 7. 패닉 → 500 JSON
+            .layer(axum::middleware::from_fn(middleware::error_envelope)) // 6. 오류 본문에 requestId. CatchPanic·Timeout보다 바깥이어야 그 응답도 본다
+            .layer(CompressionLayer::new()) // 5. error_envelope보다 바깥: 압축된 바이트는 JSON으로 읽을 수 없다
+            .layer(propagate) //                              2. 요청 ID를 응답 헤더로. CatchPanic·Timeout보다 바깥이어야 한다
+            .layer(set_id) //                                 1. 가장 바깥: 이후 모든 계층이 이 ID를 쓴다
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let config = config::Config::from_env()?; // 검증 실패면 여기서 종료 (서버가 뜨기 전)
+    println!("s08_structure  http://{}  (LAYER_ORDER={})", config.bind_addr, if config.wrong_order { "wrong" } else { "right" });
+    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
+    axum::serve(listener, app(&config)).await?;
+    Ok(())
+}
+```
+
+시험 코드는 같은 파일 아래쪽의 `#[cfg(test)] mod tests`에 있다: [s08_structure.rs](lab/examples/s08_structure.rs).
+
+| 코드 | 설명 |
+|---|---|
+| `mod config` — `Config::from_env()` + `validate()` | 설정은 **한 곳에서, 시작할 때 한 번** 읽고 검증한다. 짧은 비밀키는 서버가 뜨기 전에 거부, 기본 비밀키는 경고. 설정이 빠졌을 때 "안전한 쪽"으로 실패해야 한다 |
+| `for_test()` (`#[cfg(test)]`) | 시험이 쓰는 설정. 일반 빌드에는 포함되지 않는다 |
+| `mod error` — `AppError` + `IntoResponse` | 모든 오류 응답이 같은 모양. 핸들러는 `?`만 쓴다. 원인은 로그에만 |
+| `mod middleware` — `error_envelope` | 핸들러는 요청 헤더를 모르므로 **응답이 나가는 길목**에서 `requestId`를 채운다. 우리 코드를 거치지 않은 4xx·5xx(빈 본문 408 등)도 같은 모양으로 감싼다 |
+| `to_bytes(body, 64 * 1024)` | 오류 본문을 읽을 때 메모리 상한을 둔다. `CONTENT_LENGTH`를 지워 본문이 바뀐 걸 다시 계산하게 한다 |
+| `mod routes` | 핸들러는 얇게. `/panic`은 `CatchPanicLayer` 확인용, `/slow`는 `TimeoutLayer` 확인용 |
+| `fn app(&Config) -> Router` | **main과 시험이 같은 함수**를 쓴다 (lib + bin 구조의 이유) |
+| `.layer()`를 연달아 부르면 **나중에 붙인 것이 바깥** | 코드는 안쪽부터 적는다. (`ServiceBuilder`는 반대로 위가 바깥) |
+| ✅ 올바른 순서 | `BodyLimit`(가장 안쪽) → `Timeout` → `CatchPanic` → `error_envelope` → `Compression` → `Propagate` → `SetRequestId`(가장 바깥) |
+| `Compression`이 `error_envelope`보다 바깥 | 압축된 바이트는 JSON으로 읽을 수 없다 |
+| `error_envelope`가 `CatchPanic`·`Timeout`보다 바깥 | 그 계층들이 만든 새 응답도 봐야 `requestId`를 채울 수 있다 |
+| `Propagate`가 `CatchPanic`·`Timeout`보다 바깥 | 두 계층은 **아래 응답을 버리고 자기가 새 응답을 만든다.** 그 새 응답이 Propagate를 거쳐야 `x-request-id`가 붙는다 |
+| ❌ `wrong` 순서 | `Propagate`를 맨 안쪽에 두면 평소(`/health`)엔 멀쩡해서 **패닉·타임아웃 응답에서만** 헤더가 빠진다. "가끔 헤더가 없다"라 원인 찾기가 어렵다 |
+
+**실행 결과** (직접 실행한 결과):
+
+```
+$ cargo run --example s08_structure          (LAYER_ORDER=right)
+GET /health -> 200 OK                    x-request-id: rid-1
+GET /panic  -> 500 Internal Server Error x-request-id: rid-1
+GET /slow   -> 408 Request Timeout       x-request-id: rid-1
+GET /nope   -> 404 Not Found             x-request-id: rid-1
+오류 본문: {"error":{"code":"INTERNAL","message":"서버 내부 오류가 발생했습니다.","requestId":"rid-1"}}
+          {"error":{"code":"REQUEST_TIMEOUT","message":"Request Timeout","requestId":"rid-1"}}
+
+$ LAYER_ORDER=wrong cargo run --example s08_structure
+GET /health -> 200 OK                    x-request-id: rid-1
+GET /panic  -> 500 Internal Server Error (헤더 없음)   ❌
+GET /slow   -> 408 Request Timeout       (헤더 없음)   ❌
+GET /nope   -> 404 Not Found             x-request-id: rid-1
+오류 본문의 requestId는 그대로 있다 — error_envelope는 요청 헤더에서 읽으니까. 빠진 것은 **응답 헤더**뿐이다.
+
+$ JWT_SECRET=short cargo run --example s08_structure
+Error: JWT_SECRET이 너무 짧습니다 (최소 16자)
+```
+
+시험 (`cargo test --example s08_structure`) — 두 순서의 차이가 시험으로 고정돼 있다:
+
+```
+test tests::올바른_순서면_패닉과_타임아웃_응답에도_요청_id가_붙는다 ... ok
+test tests::잘못된_순서는_패닉과_타임아웃_응답에서만_헤더가_사라진다 ... ok
+test tests::짧은_비밀키는_시작을_거부한다 ... ok
+test result: ok. 3 passed
+```
+
+아래 3-1부터는 이 개념이 실제 프로젝트(`demo/`)에서 어떤 모양이 되는지 이어서 본다.
 
 ### 3-1. 앱 조립 — [demo/src/lib.rs](demo/src/lib.rs)
 
@@ -279,6 +558,7 @@ async fn main() -> anyhow::Result<()> {
 1. **설정이 흐르는 길 따라가기**: `CORS_ORIGIN="https://a.example.com,https://b.example.com"`로 서버를 띄우고, 두 출처 각각과 `http://localhost:5173`으로 `curl -i -X OPTIONS .../health -H "Origin: …" -H "Access-Control-Request-Method: GET"`을 보내 어느 쪽에 `access-control-allow-origin`이 오는지 본다. 환경변수 → `Config` → `AppState` → `cors_layer` 순서로 코드를 따라가 값이 바뀌는 지점을 짚어 본다.
 2. **미들웨어 순서 실험**: `PropagateRequestIdLayer`를 일부러 맨 안쪽으로 옮기고 `/health`, `/panic`, `/slow`의 `x-request-id`를 `curl -i`로 비교한다. 다시 복구한다.
 3. **중복 찾기**: `demo/src/`에서 같은 모양의 코드가 두 번 이상 나오는 곳을 하나 찾아 함수로 추출하고 테스트가 그대로 통과하는지 확인한다.
+4. **단계 예제로 실험**: `s08_structure`에서 `CompressionLayer`를 `error_envelope`보다 **안쪽**으로 옮기고 `curl -H "accept-encoding: gzip" --compressed`로 `/nope`의 오류 본문이 어떻게 되는지 본다. 왜 압축을 `error_envelope`보다 바깥에 둬야 하는지 설명해 본다.
 
 ---
 
@@ -294,6 +574,7 @@ async fn main() -> anyhow::Result<()> {
 - ☐ 허용 출처·호출 제한 같은 값이 코드에 고정되지 않고 `Config` → `AppState`로 흐르는 것을 설명할 수 있다 (`new` + `with_*` 빌더로 기본값을 유지하는 이유 포함)
 - ☐ 개발/운영에서 달라지는 값(`BIND_ADDR`, `JWT_SECRET`, `RUST_LOG`, 빌드 프로필, `Secure` 쿠키)을 표 없이 말할 수 있다
 - ☐ `panic = "abort"`를 켜면 안 되는 이유를 설명할 수 있다
+- ☐ `LAYER_ORDER=wrong`으로 `s08_structure`를 띄워 `/panic`·`/slow`에서만 `x-request-id` 헤더가 사라지는 것을 직접 보고, 올바른 순서로 복구했다
 
 ---
 
