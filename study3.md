@@ -1,399 +1,323 @@
-# JSON 제어와 입력 검증 (Study 3)
+# study3 — 데이터 다루기
 
-[study2.md](study2.md)의 마지막에서 문제를 두 개 남겨뒀습니다.
+> 🎯 **목표**: 서버가 데이터를 **메모리 상태**로 들고 있게 만들고(`Arc<RwLock<…>>`), 그것을 화면과 묶고(바인딩), 파일에 저장해 서버를 껐다 켜도 남게 한다. DB를 쓰기 전 단계에서 "데이터가 어디에 살고 누가 접근하는가"를 몸으로 익힌다.
 
-1. `{"title":""}` 같은 **빈 문자열도 그대로 통과**한다. 파싱은 성공했으니까.
-2. 오류 응답이 어떨 땐 JSON, 어떨 땐 평문이라 **클라이언트가 파싱할 수 없다.**
-
-이 문서에서 첫 번째를 해결하고, 두 번째의 **절반**(요청 본문 관련)을 해결합니다. 나머지 절반은 study4에서 마무리합니다.
-
-**이 문서에서 만드는 것**: serde 세부 제어 + `validator` 규칙 + 커스텀 extractor `ValidatedJson<T>`
-
----
-
-## 1. "파싱"과 "검증"은 다른 단계다
-
-```
-{"title":"", "content":"", "author":"w"}
-        │
-        ▼
- ① 역직렬화 (serde)   "JSON 문법이 맞고, 필드가 다 있고, 타입이 맞는가?"  → ✅ 통과
-        │
-        ▼
- ② 검증 (validator)   "그 값이 **말이 되는가**? 길이는? 형식은?"           → ❌ 실패해야 함
-        │
-        ▼
-    핸들러 본문
-```
-
-study2까지는 ①만 있었습니다. `title: String`이니까 빈 문자열도 정당한 `String`이고, serde는 통과시킵니다.
-
-| 프레임워크 | ① 역직렬화 | ② 검증 |
-|---|---|---|
-| FastAPI | Pydantic | Pydantic (같은 도구가 둘 다) |
-| NestJS | `class-transformer` | `class-validator` + `ValidationPipe` |
-| Spring | Jackson | Bean Validation (`@Valid` + `@NotBlank`) |
-| **Axum** | **serde** | **`validator` 크레이트 (직접 호출해야 함)** |
-
-**Axum에는 "검증 파이프"가 없습니다.** `validator`는 그냥 `value.validate()`를 호출하는 라이브러리일 뿐이고, **그걸 요청 처리 흐름에 끼워 넣는 건 내 몫**입니다. 그 끼워 넣는 자리가 바로 **커스텀 extractor**입니다.
-
----
-
-## 2. serde 세부 제어
-
-검증에 들어가기 전에, ① 단계에서 할 수 있는 것부터 정리합니다.
-
-### 자주 쓰는 어트리뷰트
-
-```rust
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]      // created_at → createdAt (구조체 전체)
-#[serde(deny_unknown_fields)]           // 모르는 필드가 오면 거부
-struct Example {
-    #[serde(default)]                   // 없으면 Default::default()
-    tags: Vec<String>,
-
-    #[serde(rename = "id")]             // 개별 필드 이름 변경
-    identifier: i64,
-
-    #[serde(skip_serializing_if = "Option::is_none")]  // None이면 응답에서 생략
-    nickname: Option<String>,
-
-    #[serde(skip)]                      // 직렬화/역직렬화 모두에서 제외
-    internal_flag: bool,
-
-    #[serde(skip_serializing)]          // 응답에는 안 나감 (비밀번호 해시 등)
-    password_hash: String,
-}
-```
-
-| 어트리뷰트 | 용도 | 다른 곳의 대응 |
-|---|---|---|
-| `rename_all = "camelCase"` | Rust는 snake_case, JS는 camelCase — 경계에서 변환 | Jackson `@JsonNaming`, Pydantic `alias_generator` |
-| `deny_unknown_fields` | 오타로 보낸 필드를 조용히 무시하지 않음 | Pydantic `extra="forbid"`, Nest `forbidNonWhitelisted` |
-| `default` | 선택 필드 | Pydantic 기본값 |
-| `skip_serializing` | 응답에서 감추기 | TypeORM `select: false`, Prisma `omit` |
-
-### 이번 실습에서 쓴 것
-
-```rust
-#[derive(Debug, Deserialize, Validate)]
-#[serde(deny_unknown_fields)]           // ← 오타를 잡기 위해
-pub struct CreatePost {
-    pub title: String,
-    pub content: String,
-    pub author: String,
-
-    #[serde(default)]                   // ← 안 보내면 빈 배열
-    pub tags: Vec<String>,
-}
-```
-
-`deny_unknown_fields`를 켜면 `{"titel": "오타"}`가 **조용히 무시되는 대신 오류**가 됩니다. 실제 실행 결과:
-
-```
-422 | {"error":"invalid_body","message":"Failed to deserialize the JSON body into the target type:
-       titel: unknown field `titel`, expected one of `title`, `content`, `author`, `tags`
-       at line 1 column 51"}
-```
-
-**기대한 필드 이름을 전부 알려줍니다.** 프론트엔드 개발자가 디버깅하기 아주 좋은 메시지입니다.
-
-> ⚠️ 단, API를 공개했다면 `deny_unknown_fields`는 **하위 호환을 깨기 쉽습니다.** 새 클라이언트가 새 필드를 보내면 구 서버가 거부합니다. 내부 API나 학습용에서는 켜고, 공개 API에서는 신중하게 판단하세요.
-
----
-
-## 3. `validator` 크레이트
-
-```powershell
-cargo add validator --features derive
-```
-
-### 규칙 선언
-
-```rust
-#[derive(Debug, Deserialize, Validate)]
-#[serde(deny_unknown_fields)]
-pub struct CreatePost {
-    #[validate(length(min = 1, max = 100, message = "제목은 1~100자여야 합니다"))]
-    pub title: String,
-
-    #[validate(length(min = 1, max = 5000, message = "본문은 1~5000자여야 합니다"))]
-    pub content: String,
-
-    #[validate(length(min = 2, max = 20, message = "작성자는 2~20자여야 합니다"))]
-    pub author: String,
-
-    #[serde(default)]
-    #[validate(length(max = 5, message = "태그는 최대 5개까지 가능합니다"))]
-    pub tags: Vec<String>,
-}
-```
-
-### 주요 규칙
-
-| 규칙 | 예시 | Bean Validation 대응 |
-|---|---|---|
-| `length` | `length(min = 1, max = 100)` | `@Size` |
-| `range` | `range(min = 0, max = 150)` | `@Min` / `@Max` |
-| `email` | `email` | `@Email` |
-| `url` | `url` | `@URL` |
-| `regex` | `regex(path = "*RE_SLUG")` | `@Pattern` |
-| `contains` | `contains(pattern = "@")` | — |
-| `must_match` | `must_match(other = "password")` | 비밀번호 확인 |
-| `custom` | `custom(function = "check_forbidden")` | `@AssertTrue` |
-| `nested` | `nested` | `@Valid` (중첩 객체) |
-
-### `Option<T>`에 규칙을 달면?
-
-```rust
-#[validate(length(min = 1, max = 100))]
-pub title: Option<String>,
-```
-
-**`Some`일 때만 검사합니다.** `None`은 그냥 통과합니다. 부분 수정(PATCH) DTO에 딱 맞는 동작입니다.
-
-### `length`가 세는 건 "문자" 수
-
-`String::len()`은 **바이트** 수라서 한글 1글자가 3을 차지합니다. 하지만 `validator`의 `length`는 **`chars().count()`** 를 쓰므로 한글도 1글자로 셉니다. 의도한 대로 동작합니다.
-
----
-
-## 4. 커스텀 Extractor — `ValidatedJson<T>`
-
-여기가 이번 study의 핵심입니다.
-
-### 왜 필요한가
-
-`validate()`를 핸들러마다 직접 호출할 수도 있습니다.
-
-```rust
-pub async fn create(Json(body): Json<CreatePost>) -> ... {
-    body.validate().map_err(|e| /* 응답 만들기 */)?;   // ← 매번 이걸 쓴다고?
-    // ...
-}
-```
-
-- 빠뜨리기 쉽고, 오류 응답 만드는 코드가 핸들러마다 중복됩니다.
-- **extractor로 만들면 "타입을 바꾸는 것"만으로 검증이 적용**됩니다.
-
-```rust
-// Before
-pub async fn create(Json(body): Json<CreatePost>) -> ...
-
-// After — 핸들러 본문은 한 글자도 안 바뀐다
-pub async fn create(ValidatedJson(body): ValidatedJson<CreatePost>) -> ...
-```
-
-### 구현 — `src/extract.rs`
-
-```rust
-use axum::{
-    Json,
-    extract::{FromRequest, Request, rejection::JsonRejection},
-    http::StatusCode,
-    response::{IntoResponse, Response},
-};
-use serde::de::DeserializeOwned;
-use validator::Validate;
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ValidatedJson<T>(pub T);
-
-impl<T, S> FromRequest<S> for ValidatedJson<T>
-where
-    T: DeserializeOwned + Validate,
-    S: Send + Sync,
-{
-    type Rejection = ValidatedJsonRejection;
-
-    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        // 1단계: 기본 Json extractor 재사용
-        let Json(value) = Json::<T>::from_request(req, state).await?;
-        // 2단계: validator 규칙 검사
-        value.validate()?;
-        Ok(ValidatedJson(value))
-    }
-}
-```
-
-**읽는 법:**
-
-| 부분 | 의미 |
+| 항목 | 내용 |
 |---|---|
-| `FromRequest<S>` | **본문을 소비하는** extractor용 trait. 마지막 인자에만 쓸 수 있다 |
-| `FromRequestParts<S>` | 본문을 안 건드리는 extractor용 trait (헤더, 경로 등). 위치 제한 없음 |
-| `T: DeserializeOwned + Validate` | "역직렬화 가능하고 검증 규칙을 가진 타입"에만 적용 |
-| `S: Send + Sync` | 어떤 상태 타입이든 상관없음 (상태를 안 쓰므로) |
-| `type Rejection` | **실패했을 때의 타입.** `IntoResponse`여야 한다 |
-| `Json::<T>::from_request(...)` | **기본 extractor를 안에서 재사용**한다. 바퀴를 다시 발명하지 않는다 |
+| 관련 코드 | [lab/examples/s03_store.rs](lab/examples/s03_store.rs) (`cd lab` → `cargo run --example s03_store`, 포트 3003) |
+| 검증 | 추가 → 토글 → **서버 재시작** → 데이터 유지까지 실제로 확인 |
 
-> 💡 axum 0.8에서는 trait 안에 `async fn`을 그대로 쓸 수 있습니다. 0.7 이전 예제에 붙어 있는 `#[async_trait]` 매크로는 이제 필요 없습니다. (Rust 1.75의 AFIT 안정화 덕분)
+---
 
-### 실패 타입 — 두 종류를 하나로
+## ① 목표
+
+- 모델(`struct`)과 JSON 이름 규칙(`camelCase`)을 정한다.
+- 공유 상태에서 **읽기 락과 쓰기 락**을 구분해 쓴다.
+- 데이터를 JSON 파일로 저장하고 시작할 때 복구한다 (쓰는 도중 죽어도 안전하게).
+- 서버 데이터를 DOM에 묶는 바인딩, 브라우저 `localStorage`의 용도를 이해한다.
+
+---
+
+## ② 📖 이론
+
+### 데이터는 어디에 사는가
+
+| 위치 | 수명 | 누가 접근 | 이 저장소의 단계 |
+|---|---|---|---|
+| 핸들러의 지역 변수 | 요청 하나 | 그 요청만 | study1~2 |
+| **서버 메모리(State)** | 서버 프로세스 | 모든 요청 | **study3 (여기)** |
+| **서버 파일** | 디스크 | 서버 | study3 (여기) |
+| DB | 서버와 독립 | 여러 서버·도구 | study6 |
+| 브라우저 `localStorage` | 브라우저 | 그 브라우저의 JS만 | study3 (여기) |
+
+### 동시성: 왜 락이 필요한가
+
+요청은 **동시에** 여러 개 처리된다. 두 요청이 같은 `Vec`을 동시에 수정하면 데이터가 깨진다. Rust는 이것을 **컴파일 단계에서** 막는다: 여러 스레드가 공유하는 값을 그냥 `&mut`로 바꿀 수 없다.
 
 ```rust
-#[derive(Debug)]
-pub enum ValidatedJsonRejection {
-    Json(JsonRejection),                       // 파싱 실패
-    Validation(validator::ValidationErrors),   // 검증 실패
-}
-
-impl From<JsonRejection> for ValidatedJsonRejection {
-    fn from(value: JsonRejection) -> Self { Self::Json(value) }
-}
-
-impl From<validator::ValidationErrors> for ValidatedJsonRejection {
-    fn from(value: validator::ValidationErrors) -> Self { Self::Validation(value) }
-}
+Arc<RwLock<Vec<Todo>>>
+//  │   │       └ 실제 데이터
+//  │   └ 락: 읽기는 여러 명이 동시에, 쓰기는 한 명만
+//  └ 참조 카운트: 여러 핸들러가 같은 값을 "공유 소유"
 ```
 
-**`From`을 구현하는 이유**가 중요합니다. `from_request` 본문의 `?` 두 개를 다시 보세요.
+| 도구 | 의미 |
+|---|---|
+| `Arc<T>` | 여러 곳이 같은 `T`를 소유. `clone()`은 포인터 복사 |
+| `RwLock<T>` | `read()`는 동시에 여러 개, `write()`는 하나만(그동안 다른 읽기·쓰기가 대기) |
+| `Mutex<T>` | 읽기/쓰기 구분 없이 한 번에 하나. 더 단순하고, 읽기가 압도적으로 많지 않으면 충분 |
+
+**tokio의 `RwLock` vs 표준 `std::sync::RwLock`** — 락을 잡은 채로 `.await`(파일 쓰기 등)를 해야 하면 **tokio의 락**을 쓴다. 표준 락의 guard를 `.await` 너머로 들고 있으면 컴파일 에러가 난다(아래 오류 노트).
+
+### 모델과 JSON 이름
 
 ```rust
-let Json(value) = Json::<T>::from_request(req, state).await?;   // JsonRejection
-value.validate()?;                                              // ValidationErrors
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Todo { id: u32, title: String, done: bool }
 ```
 
-서로 다른 오류 타입인데 함수 반환 타입은 하나입니다. **`?`는 `From`이 구현되어 있으면 자동으로 변환**해 줍니다. 그래서 `From`만 써두면 `?` 한 글자로 끝납니다. — **Rust 오류 처리의 핵심 관용구**이고, study4에서 이 패턴을 앱 전체로 확장합니다.
+Rust 필드는 관례대로 `snake_case`, JSON은 프론트 관례에 맞춰 `camelCase`. `#[serde(rename_all = "camelCase")]`가 **직렬화 경계에서만** 이름을 바꾼다. (공통 API 스펙 v1이 camelCase를 요구한다 → study6)
 
-### 응답 만들기
+### 바인딩이란
+
+"**데이터가 바뀌면 화면이 따라 바뀐다**"는 연결. 이 단계에서는 가장 원시적인 형태로 직접 한다.
+
+```
+서버 JSON ──fetch──▶ JS 배열 ──render()──▶ DOM
+   ▲                                      │ 클릭/제출
+   └──────────── fetch(POST/PATCH/DELETE) ◀┘   → 성공하면 다시 render()
+```
+
+프레임워크(React, Vue 등)는 이 `render()` 호출을 자동화해 줄 뿐, 본질은 같다(study12).
+
+---
+
+## ③ 🛠️ 실기
+
+### 3-1. 전체 코드 — [lab/examples/s03_store.rs](lab/examples/s03_store.rs) (서버 부분)
 
 ```rust
-impl IntoResponse for ValidatedJsonRejection {
-    fn into_response(self) -> Response {
-        match self {
-            Self::Json(rejection) => (
-                rejection.status(),        // axum이 정한 코드를 살린다 (400/415/422)
-                Json(json!({
-                    "error": "invalid_body",
-                    "message": rejection.body_text(),
-                })),
-            ).into_response(),
+use std::{path::PathBuf, sync::Arc};
+use axum::{Json, Router, extract::{Path, State}, http::StatusCode, response::Html,
+           routing::{get, patch}};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
-            Self::Validation(errors) => {
-                // ValidationErrors → { 필드명: [메시지...] }
-                let details: HashMap<String, Vec<String>> = errors
-                    .field_errors()
-                    .into_iter()
-                    .map(|(field, errs)| {
-                        let messages = errs.iter()
-                            .map(|e| e.message.as_ref()
-                                .map(|m| m.to_string())
-                                .unwrap_or_else(|| e.code.to_string()))
-                            .collect();
-                        (field.to_string(), messages)
-                    })
-                    .collect();
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Todo { id: u32, title: String, done: bool }
 
-                (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(json!({
-                        "error": "validation_failed",
-                        "message": "요청 값이 규칙에 맞지 않습니다.",
-                        "details": details,
-                    })),
-                ).into_response()
-            }
-        }
+#[derive(Debug, Deserialize)]
+struct NewTodo { title: String }
+
+#[derive(Clone)]
+struct AppState {
+    todos: Arc<RwLock<Vec<Todo>>>,
+    file: Arc<PathBuf>,
+}
+
+impl AppState {
+    async fn load(file: PathBuf) -> Self {
+        let todos = match tokio::fs::read_to_string(&file).await {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        Self { todos: Arc::new(RwLock::new(todos)), file: Arc::new(file) }
+    }
+
+    async fn save(&self, todos: &[Todo]) -> std::io::Result<()> {
+        let tmp = self.file.with_extension("json.tmp");
+        tokio::fs::write(&tmp, serde_json::to_vec_pretty(todos)?).await?;
+        tokio::fs::rename(&tmp, &*self.file).await
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let file = std::env::var("TODO_FILE").unwrap_or_else(|_| "todos.json".into());
+    let state = AppState::load(PathBuf::from(file)).await;
+
+    let app = Router::new()
+        .route("/", get(page))
+        .route("/api/todos", get(list).post(create))
+        .route("/api/todos/{id}", patch(toggle).delete(remove))
+        .with_state(state);
+    // ... bind & serve
+}
+
+async fn list(State(state): State<AppState>) -> Json<Vec<Todo>> {
+    Json(state.todos.read().await.clone())
+}
+
+async fn create(State(state): State<AppState>, Json(body): Json<NewTodo>)
+    -> Result<(StatusCode, Json<Todo>), StatusCode>
+{
+    let title = body.title.trim().to_string();
+    if title.is_empty() || title.chars().count() > 100 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut todos = state.todos.write().await;
+    let id = todos.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+    let todo = Todo { id, title, done: false };
+    todos.push(todo.clone());
+
+    state.save(&todos).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((StatusCode::CREATED, Json(todo)))
+}
+
+async fn toggle(State(state): State<AppState>, Path(id): Path<u32>)
+    -> Result<Json<Todo>, StatusCode>
+{
+    let mut todos = state.todos.write().await;
+    let todo = todos.iter_mut().find(|t| t.id == id).ok_or(StatusCode::NOT_FOUND)?;
+    todo.done = !todo.done;
+    let updated = todo.clone();
+    state.save(&todos).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(updated))
+}
+
+async fn remove(State(state): State<AppState>, Path(id): Path<u32>) -> StatusCode {
+    let mut todos = state.todos.write().await;
+    let before = todos.len();
+    todos.retain(|t| t.id != id);
+    if todos.len() == before { return StatusCode::NOT_FOUND; }
+    match state.save(&todos).await {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 ```
 
-- `rejection.status()`와 `rejection.body_text()`는 `JsonRejection`이 제공하는 메서드입니다. **axum이 이미 잘 판단한 상태 코드를 버리지 않고**, 본문 형식만 JSON으로 감쌉니다.
-- `e.message`가 `None`일 수 있어서 `unwrap_or_else(|| e.code.to_string())`으로 대비합니다. `message = "..."`를 안 적은 규칙은 `"length"` 같은 코드만 들어 있습니다.
+### 3-2. 줄별 설명
 
----
+| 코드 | 설명 |
+|---|---|
+| `todos: Arc<RwLock<Vec<Todo>>>` | 앞의 이론 그대로. `Clone`은 `Arc`만 복사하므로 싸다 |
+| `file: Arc<PathBuf>` | 저장 경로도 상태에 함께 둔다 (환경변수 `TODO_FILE`로 지정) |
+| `AppState::load` | 시작 시 파일을 읽어 복구. **파일이 없으면 빈 목록**으로 시작 |
+| `serde_json::from_str(&text).unwrap_or_default()` | JSON이 깨졌으면 빈 목록. ⚠️ **조용히 데이터를 버린다** — 개선 과제로 남겨 둠 (오류 노트) |
+| `save`: `with_extension("json.tmp")` → `write` → `rename` | **임시 파일에 다 쓴 뒤 이름만 바꾼다.** 쓰다 죽어도 원본이 반쯤 써진 채로 남지 않는다 (rename은 원자적) |
+| `Json(state.todos.read().await.clone())` | 읽기 락을 잡아 **복사**하고 락은 곧바로 풀린다. 락을 쥔 채 직렬화·전송하지 않는다 |
+| `state.todos.write().await` | **쓰기 락**. 이 변수가 살아 있는 동안 다른 모든 접근이 기다린다 → 가능한 짧게 |
+| `.map(\|t\| t.id).max().unwrap_or(0) + 1` | 새 id = 현재 최대 id + 1. 비어 있으면 1. (⚠️ 마지막 글을 지우면 id가 재사용된다 — DB의 `AUTOINCREMENT`가 필요한 이유) |
+| `todos.iter_mut().find(...).ok_or(NOT_FOUND)?` | 가변 참조로 찾고, 없으면 404로 즉시 반환 |
+| `todos.retain(\|t\| t.id != id)` | 조건에 맞는 것만 남긴다. 길이가 안 변했으면 없던 id → 404 |
+| `state.save(&todos)` | **쓰기 락을 쥔 채로 저장한다.** 저장이 끝나기 전에 다른 요청이 중간 상태를 보지 못하게 하려는 의도적 선택 (처리량은 희생) |
 
-## 5. 실행 및 검증
+### 3-3. 화면 바인딩 — 같은 파일의 HTML/JS
 
-| # | 요청 본문 | 응답 |
-|---|---|---|
-| 1 | `{"title":"Valid post","content":"body text","author":"while","tags":["rust","axum"]}` | `201` `{"id":1,...,"tags":["rust","axum"],...}` |
-| 2 | `{"title":"No tags","content":"body","author":"while"}` | `201` `{"id":2,...,"tags":[],...}` ← `#[serde(default)]` 동작 |
-| 3 | `{"title":"","content":"","author":"w"}` | `422` (아래 참고) |
-| 4 | `{...,"tags":["1","2","3","4","5","6"]}` | `422` `{"details":{"tags":["태그는 최대 5개까지 가능합니다"]},...}` |
-| 5 | `{...,"titel":"typo"}` | `422` `{"error":"invalid_body","message":"... unknown field 'titel', expected one of 'title', 'content', 'author', 'tags' ..."}` |
-| 6 | `{"title": ` (깨진 JSON) | `400` `{"error":"invalid_body","message":"Failed to parse the request body as JSON: ..."}` |
-| 7 | `Content-Type: text/plain` | `415` `{"error":"invalid_body","message":"Expected request with 'Content-Type: application/json'"}` |
-| 8 | `PATCH {"title":""}` | `422` `{"details":{"title":["제목은 1~100자여야 합니다"]},...}` |
-| 9 | `PATCH {"tags":["edited"]}` | `200` (제목·본문은 그대로, 태그만 교체) |
+```html
+<form id="form"><input id="title" autocomplete="off"><button>추가</button></form>
+<ul id="list"></ul>
+<script>
+const input = document.getElementById("title");
 
-3번의 전체 응답:
+// ① 로컬 저장소: 쓰다 만 글이 새로고침해도 남는다 (서버 저장과는 별개의 "임시 저장")
+input.value = localStorage.getItem("draft") ?? "";
+input.addEventListener("input", () => localStorage.setItem("draft", input.value));
 
-```json
-{
-  "error": "validation_failed",
-  "message": "요청 값이 규칙에 맞지 않습니다.",
-  "details": {
-    "author": ["작성자는 2~20자여야 합니다"],
-    "content": ["본문은 1~5000자여야 합니다"],
-    "title": ["제목은 1~100자여야 합니다"]
-  }
+// ② 바인딩: 서버 데이터 → DOM
+async function render() {
+  const todos = await (await fetch("/api/todos")).json();
+  document.getElementById("list").replaceChildren(...todos.map((t) => {
+    const li = document.createElement("li");
+    const span = document.createElement("span");
+    span.textContent = t.title;     // innerHTML이 아니라 textContent → XSS 방지
+    span.onclick = async () => { await fetch(`/api/todos/${t.id}`, { method: "PATCH" }); render(); };
+    li.append(span);
+    return li;
+  }));
 }
+
+// ③ 이벤트: 화면 → 서버
+document.getElementById("form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const res = await fetch("/api/todos", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: input.value }),
+  });
+  if (res.ok) { input.value = ""; localStorage.removeItem("draft"); render(); }
+});
+render();
+</script>
 ```
 
-**확인할 것 3가지:**
+- **`textContent`로 넣는다.** `innerHTML`에 제목을 넣으면 `<img onerror=...>` 같은 입력이 실행된다(XSS).
+- **서버가 성공(`res.ok`)을 답한 뒤에만** 입력창을 비우고 다시 그린다. 낙관적으로 먼저 비우면 실패했을 때 사용자가 쓴 글을 잃는다.
 
-1. **여러 필드의 오류가 한 번에 나옵니다.** 첫 번째 실패에서 멈추지 않기 때문에, 사용자가 폼을 여러 번 왕복할 필요가 없습니다.
-2. **본문 관련 오류(400/415/422)가 전부 같은 JSON 껍데기**를 갖게 되었습니다. `error` 필드로 종류를 구분할 수 있습니다.
-3. **한글 메시지가 깨지지 않습니다.** axum의 `Json` 응답은 `Content-Type: application/json`을 붙이고 UTF-8로 직렬화합니다.
-
-### 아직 남은 문제
+### 3-4. 실행 결과 (서버 재시작 검증)
 
 ```
-GET /posts/abc  → 400 | Invalid URL: Cannot parse `abc` to a `i64`     ← 평문 그대로
-GET /posts/999  → 404 | {"error":"not_found", ...}                     ← 내가 만든 JSON
-GET /nope       → 404 | (본문 없음)                                      ← 빈 응답
-```
+$ curl -X POST http://127.0.0.1:3003/api/todos -H 'content-type: application/json' -d '{"title":"learn axum"}'
+{"id":1,"title":"learn axum","done":false}
 
-**본문 밖의 오류는 아직 제각각입니다.** `Path`/`Query` extractor의 실패, 404, 405, 그리고 앞으로 생길 DB 오류까지 전부 한 형식으로 묶어야 합니다. → **study4.**
+$ curl -X POST ... -d '{"title":"   "}'      → 400  (공백만 있는 제목은 거절)
+
+$ curl -X PATCH http://127.0.0.1:3003/api/todos/1
+{"id":1,"title":"learn axum","done":true}
+
+$ cat todos.json
+[ { "id": 1, "title": "learn axum", "done": true } ]
+
+# ── 서버를 껐다가 다시 켠다 ──
+$ curl http://127.0.0.1:3003/api/todos
+[{"id":1,"title":"learn axum","done":true}]          ← 유지됨
+```
 
 ---
 
-## 6. 처음 만난 오류
+## ④ 🔗 연동 포인트
 
-### 6-1. `HashMap<&str, _> cannot be built from an iterator over (Cow<'_, str>, _)`
-
-```rust
-let details: HashMap<&str, Vec<String>> = errors.field_errors().into_iter()
-    .map(|(field, errs)| { ... (field, messages) })
-    .collect();
-```
+### 데이터를 화면과 묶는 흐름 정리
 
 ```
-error[E0277]: a value of type `HashMap<&str, Vec<String>>` cannot be built from
-              an iterator over elements of type `(Cow<'_, str>, _)`
-  = help: for that trait implementation, expected `&str`, found `Cow<'_, str>`
+브라우저 JS                      서버(Axum)                      디스크
+────────────                     ───────────                    ───────
+render()  ── GET /api/todos ───▶ read 락 → clone → JSON
+submit    ── POST /api/todos ──▶ write 락 → Vec에 push ──────▶ todos.json.tmp → rename
+          ◀── 201 + 새 Todo ───
+render()  (다시 GET)
 ```
 
-- `validator` 0.21의 `field_errors()` 키 타입이 `&str`이 아니라 **`Cow<'static, str>`** 입니다.
-- `Cow`(Clone-On-Write)는 **"빌린 값일 수도 있고 소유한 값일 수도 있다"** 를 하나의 타입으로 표현합니다. 라이브러리가 정적 문자열(`&'static str`)과 동적으로 만든 `String`을 섞어 반환할 때 씁니다.
-- 해결: 맵 타입을 `HashMap<String, Vec<String>>`으로 바꾸고 `field.to_string()`.
+### 로컬 저장소 vs 서버 파일
 
-> 이 에러가 좋은 예인 이유: **Rust 컴파일러는 "기대한 타입 / 실제 타입 / 대신 구현된 것"까지 다 알려줍니다.** 메시지를 끝까지 읽으면 대부분 해결책이 그 안에 있습니다.
+| | `localStorage` | 서버 `todos.json` |
+|---|---|---|
+| 어디에 | 사용자 브라우저 | 서버 디스크 |
+| 용도 | 임시 초안, UI 설정(다크모드), **민감하지 않은** 값 | 모두가 공유해야 하는 **진짜 데이터** |
+| 용량 | 약 5MB | 디스크 한도 |
+| 주의 | **JS가 읽을 수 있다**(XSS에 취약) → 토큰·비밀 저장 금지 (study7) | 동시 접근 → 락, 여러 서버 인스턴스에는 부적합 |
 
-### 6-2. `Json<T>`와 `ValidatedJson<T>`를 한 핸들러에 같이 쓰면?
+### 파일 저장의 한계 → DB로
 
-둘 다 본문을 소비하므로 **둘 다 마지막 인자일 수 없습니다.** 컴파일 에러가 납니다. 본문 extractor는 핸들러당 딱 하나입니다.
+- 데이터가 커질수록 **매번 전체를 다시 쓰는** 비용이 커진다.
+- 서버를 **둘 이상** 띄우면 각자 자기 파일을 갖는다.
+- 조건 검색·정렬·관계(글-작성자)를 직접 구현해야 한다.
 
-### 6-3. `#[derive(Validate)]`를 빠뜨리면
-
-```
-error[E0277]: the trait bound `CreatePost: Validate` is not satisfied
-```
-
-`ValidatedJson<T>`의 `where T: DeserializeOwned + Validate` 제약에 걸립니다. **에러가 extractor 정의가 아니라 사용 지점에서** 나므로, 메시지의 `required by a bound in ...` 줄을 보면 원인을 찾을 수 있습니다.
+그래서 [study6](study6.md)에서 DB로 넘어간다. 여기서 만든 `State`와 모델 타입은 그대로 쓰고 **저장 방식만** 바꾼다.
 
 ---
 
-## 7. 이번 study 정리
+## ⑤ 오류 노트
 
-- **파싱(serde)과 검증(validator)은 별개 단계**다. `String`이면 빈 문자열도 파싱은 통과한다.
-- serde 어트리뷰트(`rename_all`, `default`, `deny_unknown_fields`, `skip_serializing`)로 JSON 경계를 세밀하게 제어한다.
-- `validator`의 `#[validate(...)]`로 규칙을 선언하고, `Option<T>`에 붙이면 `Some`일 때만 검사한다.
-- **Axum에는 검증 파이프가 없다.** `FromRequest`를 구현한 **커스텀 extractor**가 그 자리를 대신한다.
-- extractor를 만들 때는 **기본 extractor를 안에서 재사용**하고, 여러 실패를 `enum` + `From`으로 모아 `?`로 전파한다.
-- `FromRequest`(본문 소비, 마지막 인자 전용) vs `FromRequestParts`(그 외) 구분을 기억한다. — study6에서 `FromRequestParts`로 인증 extractor를 만든다.
+| 증상 | 원인 | 해결 |
+|---|---|---|
+| 컴파일 에러: `future cannot be sent between threads safely` … `MutexGuard ... held across an await point` | `std::sync::Mutex`/`RwLock`의 guard를 `.await` 너머로 들고 있음 | 락을 잡은 채 `.await`가 필요하면 `tokio::sync::RwLock`. 아니면 guard가 `.await` 전에 drop되도록 블록 `{ }`으로 범위를 좁힌다 |
+| 요청이 **영원히 멈춤** (데드락) | 같은 태스크에서 `write()`를 잡은 채 다시 `read()`/`write()`를 호출 | 락 범위를 짧게. 한 핸들러 안에서 같은 락을 두 번 잡지 않는다 |
+| 서버를 껐다 켰더니 데이터가 사라짐 | 메모리 상태만 쓰고 파일에 저장하지 않음 | `save()` 호출 확인. 파일 경로가 **실행 위치 기준 상대경로**라서 다른 폴더에서 실행하면 다른 파일이 생긴다 |
+| `todos.json`을 손으로 고쳤다가 깨졌더니 **목록이 비어 있고, 다음 저장 때 원본이 덮어써짐** | `from_str(...).unwrap_or_default()`가 깨진 JSON을 빈 목록으로 **조용히** 처리 | 깨졌으면 시작을 실패시키거나, 원본을 `.bak`으로 옮긴 뒤 시작하도록 고친다 (직접 해보기 3) |
+| 마지막 항목을 지우고 새로 추가하면 **지운 것과 같은 id**가 생김 | id를 `max+1`로 계산 | 별도 카운터를 저장하거나 UUID, 또는 DB의 자동 증가 |
+| 한글 제목이 `???`로 저장/표시 | 터미널에서 한글 JSON을 `-d`로 보냄 (코드페이지) | UTF-8 파일로 저장해 `curl --data-binary @file.json` |
+| 제목에 `<script>`를 넣었더니 실행됨 | `innerHTML`로 그림 | `textContent`로 넣는다 |
+| 동시에 많이 요청하면 느려짐 | 쓰기 락을 쥔 채 파일 쓰기 (직렬화) | 학습용으로는 허용. 쓰기가 많다면 DB나 별도 쓰기 태스크(채널)로 분리 |
 
-다음: [study4.md](study4.md) — 앱 전체의 오류를 `AppError` 하나로 통일하기.
+---
+
+## ⑥ 직접 해보기
+
+1. **필드 추가**: `Todo`에 `createdAt`(문자열 시각)을 추가하고, 이전 버전의 `todos.json`(필드 없음)이 있어도 읽히도록 `#[serde(default)]`를 쓴다. 어떤 JSON이 읽히고 어떤 것이 깨지는지 실험한다.
+2. **필터**: `GET /api/todos?done=true`로 완료/미완료만 돌려주도록 `Query<Filter>`를 추가한다 (study4의 `Query` 복습).
+3. **깨진 파일을 조용히 버리지 않기**: `load`가 JSON 파싱에 실패하면 파일을 `todos.json.broken`으로 옮기고 경고 로그를 남긴 뒤 빈 목록으로 시작하도록 고친다.
+
+---
+
+## ⑦ ☐ 체크리스트
+
+- ☐ 데이터가 사는 곳(요청 지역 / 서버 메모리 / 파일 / DB / 브라우저)의 차이를 표 없이 설명할 수 있다
+- ☐ `Arc<RwLock<Vec<T>>>`의 각 겹이 하는 일을 설명할 수 있다
+- ☐ `read()`와 `write()`의 차이, 쓰기 락을 오래 쥐면 안 되는 이유를 안다
+- ☐ tokio의 `RwLock`을 쓰는 이유(`.await` 너머로 guard를 들고 있기 위해)를 설명할 수 있다
+- ☐ `#[serde(rename_all = "camelCase")]`로 JSON 이름을 바꿨다
+- ☐ 임시 파일 → `rename`으로 저장하는 이유를 설명할 수 있다
+- ☐ 서버를 재시작해도 데이터가 남는 것을 직접 확인했다
+- ☐ `innerHTML` 대신 `textContent`를 쓰는 이유를 안다
+- ☐ `localStorage`에 넣으면 안 되는 것을 안다
+
+---
+
+## ⑧ 다음 단계 연결
+
+데이터가 생겼으니 [study4](study4.md)에서는 그 데이터를 **URL로 가리키는 법**을 다룬다: 동적 경로·쿼리·리다이렉트·404 처리, 그리고 프론트와 백엔드의 경로를 어긋나지 않게 맞추는 방법.
