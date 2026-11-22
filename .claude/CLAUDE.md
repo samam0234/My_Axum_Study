@@ -14,4 +14,6 @@
 - **Windows PowerShell 5.1의 `Get-Content -Raw` / `Set-Content`로 소스 파일을 편집하지 마세요.** `Get-Content`가 BOM 없는 UTF-8 파일을 시스템 ANSI 코드페이지로 읽어버려서 한글 주석이 전부 깨집니다(`議곕┰留?` 같은 문자열이 됨). 파일 수정은 Edit/Write 도구를 쓰거나, 최소한 `-Encoding utf8`을 읽기/쓰기 양쪽에 모두 지정해야 합니다.
 - sqlx의 컴파일 타임 검증 매크로(`query!`, `query_as!`)는 빌드 시점에 실제 DB 연결 또는 `.sqlx/` 오프라인 캐시를 요구합니다. 학습용으로는 런타임 검증 함수 버전(`sqlx::query`, `sqlx::query_as::<_, T>`)을 쓰는 편이 환경 의존성이 적어 안전합니다.
 - 같은 워크스페이스의 `Spring_Boot/`, `python/FastApi/`, `nest.js/` 학습 저장소와 커리큘럼이 대응되므로, 개념 설명 시 "Spring의 `@RestController` ≈ Axum의 핸들러 함수 + `Router`", "FastAPI의 `Depends` ≈ Axum의 extractor", "Nest의 Guard ≈ Axum의 `FromRequestParts` 또는 tower `Layer`" 식으로 비교해주면 사용자의 기존 지식과 연결하기 좋습니다.
+  - **단, `study*.md` 학습 문서에는 다른 프레임워크와의 비교·통합을 넣지 않는다.** (문서는 Axum 하나만 다룬다는 사용자 지시. 위 비교는 대화에서 개념을 풀어 설명할 때만 쓴다.)
+- 학습 문서는 모두 8단 구성(목표·이론·실기·연동·오류 노트·직접 해보기·☐ 체크리스트·다음 단계)이며, 실행 결과는 **직접 돌려서 얻은 것만** 싣는다. 자세한 규칙은 [../.agent/AGENTS.md](../.agent/AGENTS.md).
 - Axum은 메이저 버전마다 API가 꽤 바뀝니다(0.6 → 0.7에서 `Server` 제거 및 `axum::serve` 도입, 0.8에서 경로 파라미터 문법이 `:id` → `{id}`로 변경). 답변/코드 작성 전에 `Cargo.toml`에 고정된 실제 버전을 먼저 확인합니다.
