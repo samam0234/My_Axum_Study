@@ -18,11 +18,11 @@ Rust 웹 프레임워크 [Axum](https://github.com/tokio-rs/axum) **하나만** 
 | [study3.md](study3.md) | **데이터 다루기** — `Arc<RwLock<…>>`, 파일 저장(임시 파일 + rename), 화면 바인딩, `localStorage` | [s03_store.rs](lab/examples/s03_store.rs) |
 | [study4.md](study4.md) | **라우팅과 요청 처리** — 동적/와일드카드 경로, 쿼리, 404/405, 미들웨어 흐름, CORS | [s04_routing.rs](lab/examples/s04_routing.rs) |
 | [study5.md](study5.md) | **폼·입력·검증** — `validator`, `ValidatedJson`, 상태 코드별 화면, 중복 제출 방지 | [s05_form.rs](lab/examples/s05_form.rs) |
-| [study6.md](study6.md) | **DB·API 연동** — sqlx CRUD, 마이그레이션, **공통 API 스펙 v1**(`/api`, `{ data, meta }`, 오류 본문, 댓글, 429), 환경변수 | [demo/](demo/) |
-| [study7.md](study7.md) | **인증·보안 기초** — Argon2, JWT, `AuthUser`, 401/403, CORS·XSS·CSRF, Bearer vs 쿠키 | [demo/src/auth/](demo/src/auth/) |
-| [study8.md](study8.md) | **구조화·재사용** — lib+bin, 공통 모듈, `Config`, 미들웨어 순서, 개발/운영 설정 | [demo/src/lib.rs](demo/src/lib.rs) |
-| [study9.md](study9.md) | **테스트·디버깅** — 단위·`oneshot` 테스트, 로그, 오류 TOP 10, mock | [demo/tests/](demo/tests/), [lab/src/mock_demo.rs](lab/src/mock_demo.rs) |
-| [study10.md](study10.md) | **배포·정리** — 릴리스 빌드, 멀티 스테이지 Docker, HTTPS 개념, 배포 후 점검표, 기초 총정리 | [demo/Dockerfile](demo/Dockerfile) |
+| [study6.md](study6.md) | **DB·API 연동** — sqlx CRUD, 마이그레이션, **공통 API 스펙 v1**(`/api`, `{ data, meta }`, 오류 본문, 댓글, 429), 환경변수 | [s06_db.rs](lab/examples/s06_db.rs), [demo/](demo/) |
+| [study7.md](study7.md) | **인증·보안 기초** — Argon2, JWT, `AuthUser`, 401/403, CORS·XSS·CSRF, Bearer vs 쿠키 | [s07_auth.rs](lab/examples/s07_auth.rs), [demo/src/auth/](demo/src/auth/) |
+| [study8.md](study8.md) | **구조화·재사용** — lib+bin, 공통 모듈, `Config`, 미들웨어 순서, 개발/운영 설정 | [s08_structure.rs](lab/examples/s08_structure.rs), [demo/src/lib.rs](demo/src/lib.rs) |
+| [study9.md](study9.md) | **테스트·디버깅** — 단위·`oneshot` 테스트, 로그, 오류 TOP 10, mock | [s09_testing.rs](lab/examples/s09_testing.rs), [demo/tests/](demo/tests/), [lab/src/mock_demo.rs](lab/src/mock_demo.rs) |
+| [study10.md](study10.md) | **배포·정리** — 릴리스 빌드, 멀티 스테이지 Docker, HTTPS 개념, 배포 후 점검표, 기초 총정리 | [s10_deploy.rs](lab/examples/s10_deploy.rs), [demo/Dockerfile](demo/Dockerfile) |
 
 ### 중간 응용
 
@@ -39,7 +39,7 @@ Rust 웹 프레임워크 [Axum](https://github.com/tokio-rs/axum) **하나만** 
 | [study13.md](study13.md) | **외부 서비스** — 결제 웹훅(HMAC), 메일, 파일 업로드, 소셜 로그인(OAuth2) | [s13_external.rs](lab/examples/s13_external.rs) |
 | [study14.md](study14.md) | **API 설계** — REST 규칙, OpenAPI, 버전, 오프셋/커서, 오류 규칙, ETag | [s14_api_design.rs](lab/examples/s14_api_design.rs) |
 | [study15.md](study15.md) | **성능·캐시** — TTL 캐시, 작업 큐, `spawn_blocking`, 측정 | [s15_cache_jobs.rs](lab/examples/s15_cache_jobs.rs) |
-| [study16.md](study16.md) | **운영·CI/CD** — Docker 체크리스트, GitHub Actions, 로그·모니터링, 백업·복원 | [.github/workflows/](.github/workflows/) |
+| [study16.md](study16.md) | **운영·CI/CD** — Docker 체크리스트, GitHub Actions, 로그·모니터링, 백업·복원 | [s16_ops.rs](lab/examples/s16_ops.rs), [.github/workflows/](.github/workflows/) |
 | [study17.md](study17.md) | **실시간·확장** — WebSocket, SSE, 스트리밍 업로드 | [s17_realtime.rs](lab/examples/s17_realtime.rs) |
 | [study18.md](study18.md) | **AI 연동·MCP** — AI 서버 호출, 프롬프트 설계, 스트리밍, MCP; DocuForge 연결 | [s18_ai.rs](lab/examples/s18_ai.rs) |
 
@@ -129,19 +129,24 @@ cargo run --example s18_ai             # study18, 포트 3018 (가짜 AI 서버 
 
 | 예제 | 포트 | 문서 | | 예제 | 포트 | 문서 |
 |---|---|---|---|---|---|---|
-| `s01_hello` | 3001 | study1 | | `s12_front` | 3012 | study12 |
-| `s02_modules` | 3002 | study2 | | `s13_external` | 3013 | study13 |
-| `s03_store` | 3003 | study3 | | `s14_api_design` | 3014 | study14 |
-| `s04_routing` | 3004 | study4 | | `s15_cache_jobs` | 3015 | study15 |
-| `s05_form` | 3005 | study5 | | `s17_realtime` | 3017 | study17 |
-| `s11_mongo` | 3011 | study11 | | `s18_ai` | 3018 | study18 |
+| `s01_hello` | 3001 | study1 | | `s10_deploy` | 3010 | study10 |
+| `s02_modules` | 3002 | study2 | | `s11_mongo` | 3011 | study11 |
+| `s03_store` | 3003 | study3 | | `s12_front` | 3012 | study12 |
+| `s04_routing` | 3004 | study4 | | `s13_external` | 3013 | study13 |
+| `s05_form` | 3005 | study5 | | `s14_api_design` | 3014 | study14 |
+| `s06_db` | 3006 | study6 | | `s15_cache_jobs` | 3015 | study15 |
+| `s07_auth` | 3007 | study7 | | `s16_ops` | 3016 | study16 |
+| `s08_structure` | 3008 | study8 | | `s17_realtime` | 3017 | study17 |
+| `s09_testing` | 3009 | study9 | | `s18_ai` | 3018 | study18 |
+
+(studyMidpoint·studyFinal은 단계 예제를 합친 `demo/`·`project/`가 결과물이라 따로 예제가 없다)
 
 ## 테스트
 
 ```powershell
 cd demo    ; cargo test                       # 단위 12 + 통합 31
 cd project ; cargo test --workspace           # domain 서비스 8 + 유틸 1, web 단위 6 + HTTP 20
-cd lab     ; cargo test --lib --examples      # mock 3 + 웹훅 서명 3 + 프롬프트/스트림 3
+cd lab     ; cargo test --lib --examples      # 예제별 시험 + mock 3 (s06 3 · s07 4 · s08 3 · s09 6 · s10 3 · s13 3 · s16 3 · s18 3)
 cd lab     ; node --test static/api.test.mjs  # 프론트 API 클라이언트 9
 ```
 
