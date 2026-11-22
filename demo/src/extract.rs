@@ -100,7 +100,7 @@ where
 
 impl From<JsonRejection> for AppError {
     fn from(rejection: JsonRejection) -> Self {
-        // axum이 이미 400/415/422를 적절히 판단해 두었으므로 그대로 살린다.
+        // axum이 판단한 상태 코드를 담아 두고, 스펙에 맞는 정규화(422 → 400)는 AppError가 한다.
         AppError::InvalidBody {
             status: rejection.status(),
             message: rejection.body_text(),

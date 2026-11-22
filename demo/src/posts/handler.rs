@@ -19,7 +19,7 @@ use crate::upload;
     params(PageQuery),
     responses(
         (status = 200, description = "게시글 페이지", body = Page<Post>),
-        (status = 422, description = "페이지 파라미터 범위 오류"),
+        (status = 400, description = "페이지 파라미터 범위 오류 (VALIDATION_ERROR)"),
     )
 )]
 pub async fn list(
@@ -60,7 +60,7 @@ pub async fn get_one(State(state): State<AppState>, Path(id): Path<i64>) -> AppR
     responses(
         (status = 201, description = "생성됨", body = Post),
         (status = 401, description = "인증 필요"),
-        (status = 422, description = "검증 실패"),
+        (status = 400, description = "검증 실패 (VALIDATION_ERROR)"),
     )
 )]
 pub async fn create(

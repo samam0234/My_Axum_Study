@@ -96,18 +96,22 @@ pub fn app(state: AppState) -> Router {
                 .layer(TraceLayer::new_for_http())
                 // 4. 처리 시간 측정 헤더
                 .layer(axum::middleware::from_fn(middleware::response_time))
-                // 5. 패닉을 500 JSON으로 (연결이 끊기지 않게)
+                // 5. 응답 압축 — error_envelope보다 **바깥**이어야 한다.
+                //    (압축된 바이트는 error_envelope가 JSON으로 읽을 수 없다)
+                .layer(CompressionLayer::new())
+                // 6. 오류 본문에 requestId를 채우고, AppError를 거치지 않은 4xx·5xx도
+                //    스펙 모양으로 감싼다. CatchPanic·Timeout보다 바깥이어야 그 응답도 본다.
+                .layer(axum::middleware::from_fn(middleware::error_envelope))
+                // 7. 패닉을 500 JSON으로 (연결이 끊기지 않게)
                 .layer(CatchPanicLayer::custom(middleware::on_panic))
-                // 6. 타임아웃
+                // 8. 타임아웃
                 .layer(TimeoutLayer::with_status_code(
                     StatusCode::REQUEST_TIMEOUT,
                     middleware::REQUEST_TIMEOUT,
                 ))
-                // 7. 응답 압축
-                .layer(CompressionLayer::new())
-                // 8. CORS
+                // 9. CORS
                 .layer(cors_layer())
-                // 9. 요청 본문 크기 제한 — 가장 안쪽
+                // 10. 요청 본문 크기 제한 — 가장 안쪽
                 .layer(DefaultBodyLimit::max(middleware::BODY_LIMIT_BYTES)),
         )
 }

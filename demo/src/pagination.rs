@@ -46,6 +46,7 @@ impl PageQuery {
 /// 배열을 그대로 반환하면 "전체가 몇 건인지", "다음 페이지가 있는지"를 알려줄 자리가 없다.
 // utoipa 5는 제네릭 스키마를 그대로 지원한다. (4까지 있던 #[aliases]는 제거됨)
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")] // per_page → perPage, total_pages → totalPages, has_next → hasNext
 pub struct Page<T> {
     pub items: Vec<T>,
     pub page: u32,

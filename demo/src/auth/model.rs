@@ -19,6 +19,7 @@ pub struct UserRow {
 
 /// API 응답용 사용자 정보. **비밀번호 해시 필드가 아예 없다.**
 #[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct UserPublic {
     pub id: i64,
     pub username: String,
@@ -64,6 +65,7 @@ pub struct LoginRequest {
 
 /// 로그인 성공 응답
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")] // access_token → accessToken
 pub struct TokenResponse {
     pub access_token: String,
     pub token_type: &'static str,

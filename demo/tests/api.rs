@@ -97,7 +97,7 @@ async fn signup_and_login(app: &Router, username: &str) -> String {
     .await;
     assert_eq!(status, StatusCode::OK, "로그인 실패");
 
-    body["access_token"].as_str().unwrap().to_string()
+    body["accessToken"].as_str().unwrap().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -117,8 +117,8 @@ async fn 없는_경로는_통일된_404_json을_돌려준다() {
     let (status, body) = request(&app, "GET", "/nope", None, None).await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body["error"], "not_found");
-    assert!(body["message"].is_string());
+    assert_eq!(body["error"]["code"], "NOT_FOUND");
+    assert!(body["error"]["message"].is_string());
 }
 
 #[tokio::test]
@@ -127,7 +127,7 @@ async fn 메서드가_다르면_405다() {
     let (status, body) = request(&app, "DELETE", "/health", None, None).await;
 
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(body["error"], "method_not_allowed");
+    assert_eq!(body["error"]["code"], "METHOD_NOT_ALLOWED");
 }
 
 #[tokio::test]
@@ -136,7 +136,7 @@ async fn 패닉해도_500_json이_나간다() {
     let (status, body) = request(&app, "GET", "/panic", None, None).await;
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body["error"], "internal_error");
+    assert_eq!(body["error"]["code"], "INTERNAL");
 }
 
 #[tokio::test]
@@ -152,7 +152,7 @@ async fn 토큰_없이는_글을_쓸_수_없다() {
     .await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(body["error"], "unauthorized");
+    assert_eq!(body["error"]["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -236,11 +236,11 @@ async fn 남의_글은_수정할_수_없다() {
     .await;
 
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["error"], "forbidden");
+    assert_eq!(body["error"]["code"], "FORBIDDEN");
 }
 
 #[tokio::test]
-async fn 검증_실패는_422와_필드별_상세를_준다() {
+async fn 검증_실패는_400과_필드별_fields를_준다() {
     let app = test_app().await;
     let token = signup_and_login(&app, "alice").await;
 
@@ -253,10 +253,10 @@ async fn 검증_실패는_422와_필드별_상세를_준다() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body["error"], "validation_failed");
-    assert!(body["details"]["title"].is_array());
-    assert!(body["details"]["content"].is_array());
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+    assert!(body["error"]["fields"]["title"].is_array());
+    assert!(body["error"]["fields"]["content"].is_array());
 }
 
 #[tokio::test]
@@ -278,7 +278,7 @@ async fn 중복_가입은_409다() {
     .await;
 
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["error"], "conflict");
+    assert_eq!(body["error"]["code"], "EMAIL_TAKEN");
 }
 
 #[tokio::test]
@@ -306,8 +306,11 @@ async fn 로그인_실패_메시지는_아이디_존재_여부를_알려주지_�
 
     assert_eq!(s1, StatusCode::UNAUTHORIZED);
     assert_eq!(s2, StatusCode::UNAUTHORIZED);
-    // 두 경우의 응답이 완전히 같아야 한다 (user enumeration 방지)
-    assert_eq!(b1, b2);
+    assert_eq!(b1["error"]["code"], "INVALID_CREDENTIALS");
+    // 두 경우의 응답이 완전히 같아야 한다 (user enumeration 방지).
+    // requestId는 요청마다 달라지므로 비교에서 뺀다.
+    assert_eq!(b1["error"]["message"], b2["error"]["message"]);
+    assert_eq!(b1["error"]["code"], b2["error"]["code"]);
 }
 
 #[tokio::test]
@@ -330,13 +333,13 @@ async fn 페이지네이션이_동작한다() {
     let (status, page1) = request(&app, "GET", "/posts?page=1&per_page=3", None, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(page1["total"], 7);
-    assert_eq!(page1["total_pages"], 3);
-    assert_eq!(page1["has_next"], true);
+    assert_eq!(page1["totalPages"], 3);
+    assert_eq!(page1["hasNext"], true);
     assert_eq!(page1["items"].as_array().unwrap().len(), 3);
 
     let (_, page3) = request(&app, "GET", "/posts?page=3&per_page=3", None, None).await;
     assert_eq!(page3["items"].as_array().unwrap().len(), 1);
-    assert_eq!(page3["has_next"], false);
+    assert_eq!(page3["hasNext"], false);
 }
 
 #[tokio::test]
@@ -361,10 +364,49 @@ async fn sql_인젝션_시도는_그냥_검색어로_취급된다() {
 }
 
 #[tokio::test]
-async fn 페이지_파라미터_범위를_벗어나면_422다() {
+async fn 페이지_파라미터_범위를_벗어나면_400이다() {
     let app = test_app().await;
 
     let (status, body) = request(&app, "GET", "/posts?per_page=1000", None, None).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert!(body["details"]["per_page"].is_array());
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+    assert!(body["error"]["fields"]["per_page"].is_array());
+}
+
+#[tokio::test]
+async fn 응답_json은_camel_case다() {
+    let app = test_app().await;
+    let token = signup_and_login(&app, "alice").await;
+
+    let (_, created) = request(
+        &app,
+        "POST",
+        "/posts",
+        Some(json!({ "title": "camel", "content": "본문" })),
+        Some(&token),
+    )
+    .await;
+
+    assert!(created["createdAt"].is_string());
+    assert!(created["authorId"].is_number());
+    // snake_case 키가 남아 있으면 안 된다
+    assert!(created.get("created_at").is_none());
+    assert!(created.get("author_id").is_none());
+}
+
+#[tokio::test]
+async fn 오류_본문의_request_id는_응답_헤더와_같다() {
+    let app = test_app().await;
+
+    let request = Request::builder()
+        .uri("/nope")
+        .header("x-request-id", "test-req-123")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+
+    assert_eq!(response.headers()["x-request-id"], "test-req-123");
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["requestId"], "test-req-123");
 }

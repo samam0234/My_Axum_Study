@@ -5,7 +5,11 @@ use utoipa::ToSchema;
 use validator::Validate;
 
 /// API 응답으로 나가는 게시글.
+///
+/// 공통 API 스펙 v1: 응답 JSON 필드는 camelCase (`authorId`, `createdAt`).
+/// Rust 필드는 관례대로 snake_case로 두고 **직렬화 경계에서만** 이름을 바꾼다.
 #[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct Post {
     pub id: i64,
     pub title: String,

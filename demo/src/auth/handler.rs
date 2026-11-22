@@ -16,7 +16,7 @@ use crate::state::AppState;
     responses(
         (status = 201, description = "가입됨", body = UserPublic),
         (status = 409, description = "아이디/이메일 중복"),
-        (status = 422, description = "검증 실패"),
+        (status = 400, description = "검증 실패 (VALIDATION_ERROR)"),
     )
 )]
 pub async fn register(
@@ -52,15 +52,11 @@ pub async fn login(
     // ⚠️ "없는 아이디"와 "틀린 비밀번호"를 구분해서 알려주면 안 된다.
     //    공격자가 가입된 아이디 목록을 수집할 수 있게 되기 때문(user enumeration).
     let Some(user) = row else {
-        return Err(AppError::Unauthorized(
-            "아이디 또는 비밀번호가 올바르지 않습니다".into(),
-        ));
+        return Err(AppError::InvalidCredentials);
     };
 
     if !password::verify(body.password, user.password_hash.clone()).await? {
-        return Err(AppError::Unauthorized(
-            "아이디 또는 비밀번호가 올바르지 않습니다".into(),
-        ));
+        return Err(AppError::InvalidCredentials);
     }
 
     let token = jwt::encode_token(&state.jwt_secret, user.id, &user.username)?;
@@ -94,14 +90,14 @@ pub async fn me(State(state): State<AppState>, auth: AuthUser) -> AppResult<Json
         .ok_or_else(|| AppError::not_found("user", auth.id))
 }
 
-/// UNIQUE 제약 위반을 409 Conflict로 바꾼다.
+/// UNIQUE 제약 위반을 409 `EMAIL_TAKEN`으로 바꾼다.
 ///
 /// sqlx::Error를 그대로 `?`로 던지면 500이 된다. "이미 있는 아이디"는 서버 잘못이 아니므로
 /// 여기서 의미 있는 상태 코드로 번역해 준다.
 fn map_unique_violation(err: sqlx::Error) -> AppError {
     if let sqlx::Error::Database(ref db_err) = err {
         if db_err.is_unique_violation() {
-            return AppError::Conflict("이미 사용 중인 아이디 또는 이메일입니다".into());
+            return AppError::EmailTaken;
         }
     }
     AppError::Database(err)
