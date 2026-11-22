@@ -8,6 +8,10 @@ FROM rust:1.98-slim-bookworm AS builder
 
 WORKDIR /app
 
+# 빌드 옵션. 기본은 SQLite. PostgreSQL 이미지는 이렇게 만든다 (study11):
+#   docker build --build-arg CARGO_FLAGS="--no-default-features --features postgres" -t axum-demo:pg .
+ARG CARGO_FLAGS=""
+
 # ── 의존성 레이어 캐싱 트릭 ────────────────────────────────────────────────
 # Cargo.toml/Cargo.lock만 먼저 복사하고 빈 소스로 한 번 빌드하면,
 # 의존성 컴파일 결과가 Docker 레이어로 캐시된다.
@@ -17,16 +21,17 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src \
     && echo 'fn main() {}' > src/main.rs \
     && echo '' > src/lib.rs \
-    && cargo build --release \
+    && cargo build --release ${CARGO_FLAGS} \
     && rm -rf src
 
 # 실제 소스 복사 후 재빌드
 COPY src ./src
 COPY migrations ./migrations
+COPY migrations_pg ./migrations_pg
 
 # 더미 빌드의 산출물이 남아 있으면 새 소스를 반영하지 않으므로 타임스탬프를 갱신한다.
 RUN touch src/main.rs src/lib.rs \
-    && cargo build --release
+    && cargo build --release ${CARGO_FLAGS}
 
 # ---------------------------------------------------------------------------
 # 2단계: 실행

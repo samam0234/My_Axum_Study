@@ -11,6 +11,9 @@
 //!
 //! Spring의 MockMvc, Nest의 Supertest에 해당한다.
 
+// 테스트는 in-memory SQLite를 쓰므로 sqlite feature(기본값)에서만 컴파일한다.
+#![cfg(feature = "sqlite")]
+
 use axum::{
     Router,
     body::Body,

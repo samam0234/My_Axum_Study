@@ -12,7 +12,7 @@ pub async fn insert(
     sqlx::query_as::<_, UserRow>(
         r#"
         INSERT INTO users (username, email, password_hash, created_at)
-        VALUES (?, ?, ?, ?)
+        VALUES ($1, $2, $3, $4)
         RETURNING id, username, email, password_hash, created_at
         "#,
     )
@@ -29,7 +29,7 @@ pub async fn find_by_username(
     username: &str,
 ) -> Result<Option<UserRow>, sqlx::Error> {
     sqlx::query_as::<_, UserRow>(
-        "SELECT id, username, email, password_hash, created_at FROM users WHERE username = ?",
+        "SELECT id, username, email, password_hash, created_at FROM users WHERE username = $1",
     )
     .bind(username)
     .fetch_optional(db)
@@ -38,7 +38,7 @@ pub async fn find_by_username(
 
 pub async fn find_by_id(db: &DbPool, id: i64) -> Result<Option<UserRow>, sqlx::Error> {
     sqlx::query_as::<_, UserRow>(
-        "SELECT id, username, email, password_hash, created_at FROM users WHERE id = ?",
+        "SELECT id, username, email, password_hash, created_at FROM users WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(db)

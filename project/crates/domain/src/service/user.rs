@@ -69,10 +69,14 @@ pub async fn find(db: &DatabaseConnection, id: i32) -> DomainResult<user::Model>
 }
 
 fn map_unique_violation(err: sea_orm::DbErr) -> DomainError {
-    // SeaORM은 SQLSTATE를 그대로 노출하지 않으므로 메시지로 판단한다.
-    // (Postgres라면 sqlx 쪽처럼 에러 코드로 더 정확히 볼 수 있다)
-    let text = err.to_string();
-    if text.contains("UNIQUE constraint failed") {
+    // `sql_err()`는 DB 종류(SQLite/PostgreSQL/MySQL)에 상관없이 UNIQUE 위반을 알려 준다.
+    // 예전에는 메시지에 "UNIQUE constraint failed"가 있는지 문자열로 판단했는데,
+    // PostgreSQL의 메시지는 "duplicate key value violates unique constraint"라서
+    // DB를 바꾸는 순간 409가 500으로 바뀌었다. (study11)
+    if matches!(
+        err.sql_err(),
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+    ) {
         DomainError::Conflict("이미 사용 중인 아이디 또는 이메일입니다".to_string())
     } else {
         DomainError::Database(err)

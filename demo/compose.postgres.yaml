@@ -1,0 +1,22 @@
+# 로컬 개발용 PostgreSQL. 앱은 `cargo run --no-default-features --features postgres`로 따로 띄운다.
+#   docker compose -f compose.postgres.yaml up -d
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres   # ⚠️ 로컬 전용. 운영에서는 시크릿 관리 도구를 쓴다.
+      POSTGRES_DB: board
+    ports:
+      # 호스트에 이미 PostgreSQL이 5432를 쓰고 있으면 PG_PORT=55432 처럼 바꾼다.
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d board"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pg-data:

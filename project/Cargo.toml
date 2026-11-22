@@ -21,8 +21,10 @@ argon2 = "0.6.0"
 axum = "0.8.9"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
-sea-orm = { version = "1.1", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-chrono"] }
-sea-orm-migration = { version = "1.1", default-features = false, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+# DB 드라이버를 둘 다 컴파일해 두면 DATABASE_URL의 스킴(sqlite:// / postgres://)만 보고
+# 실행 시점에 백엔드가 정해진다. (sqlx-mysql은 MariaDB도 같이 쓴다) 엔티티·서비스·마이그레이션 코드는 한 줄도 바뀌지 않는다. (study11)
+sea-orm = { version = "1.1", default-features = false, features = ["sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "runtime-tokio-rustls", "macros", "with-chrono"] }
+sea-orm-migration = { version = "1.1", default-features = false, features = ["sqlx-sqlite", "sqlx-postgres", "sqlx-mysql", "runtime-tokio-rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"

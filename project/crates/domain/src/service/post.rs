@@ -1,8 +1,9 @@
 //! 게시글 서비스.
 
 use chrono::Utc;
+use sea_orm::sea_query::{Expr, Func};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, ModelTrait,
+    ActiveModelTrait, Condition, DatabaseConnection, EntityTrait, ModelTrait,
     PaginatorTrait, QueryFilter, QueryOrder, Set,
 };
 use serde::Serialize;
@@ -60,10 +61,14 @@ pub async fn list(
 ) -> DomainResult<PostPage> {
     let mut condition = Condition::all();
     if let Some(keyword) = q.map(str::trim).filter(|s| !s.is_empty()) {
+        // `contains()`는 그냥 `LIKE '%..%'`라서 SQLite에서는 대소문자를 무시하지만
+        // PostgreSQL에서는 구분한다. DB를 바꿔도 같은 결과가 나오도록 양쪽을 소문자로 맞춘다.
+        // (PostgreSQL 전용 `ILIKE`는 SQLite에서 쓸 수 없다)
+        let pattern = format!("%{}%", keyword.to_lowercase());
         condition = condition.add(
             Condition::any()
-                .add(post::Column::Title.contains(keyword))
-                .add(post::Column::Body.contains(keyword)),
+                .add(Expr::expr(Func::lower(Expr::col(post::Column::Title))).like(pattern.clone()))
+                .add(Expr::expr(Func::lower(Expr::col(post::Column::Body))).like(pattern)),
         );
     }
 
