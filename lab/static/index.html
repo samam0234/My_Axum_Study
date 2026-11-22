@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>study12 — 프론트 연동</title>
+  <style>body{font-family:sans-serif;max-width:520px;margin:2rem auto} pre{background:#f4f4f4;padding:.6rem}</style>
+</head>
+<body>
+  <h1>프론트 ↔ Axum 연동 확인</h1>
+  <p>이 페이지는 Axum이 <code>static/</code> 폴더에서 직접 서빙합니다 (같은 출처 → CORS 불필요).</p>
+  <button id="login">로그인(쿠키 발급)</button>
+  <button id="me">내 정보</button>
+  <button id="logout">로그아웃</button>
+  <pre id="out">(결과)</pre>
+<script type="module">
+// 화면 코드는 fetch도 상태 코드도 모른다. api()와 ApiError만 쓴다. (api.js 참고)
+import { api, ApiError } from "/api.js";
+
+const out = document.getElementById("out");
+const run = async (path, method = "GET") => {
+  try {
+    // 같은 출처라서 쿠키는 자동으로 간다. 다른 출처(Vite :5173 → :3012)면 { base, credentials: true }가 필요하다.
+    const res = await api(path, { method, credentials: true });
+    out.textContent = JSON.stringify(res, null, 2);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    out.textContent = `${e.status} ${e.code}\n${e.message}` + (e.requestId ? `\nrequestId: ${e.requestId}` : "");
+  }
+};
+document.getElementById("login").onclick  = () => run("/api/login", "POST");
+document.getElementById("me").onclick     = () => run("/api/me");
+document.getElementById("logout").onclick = () => run("/api/logout", "POST");
+</script>
+</body>
+</html>
