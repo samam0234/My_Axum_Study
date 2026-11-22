@@ -1,505 +1,347 @@
-# 테스트 · 설정 · 로깅 (Study 9 · 고급 4)
+# study9 — 테스트 · 디버깅
 
-지금까지 기능을 확인하는 방법은 **서버를 띄우고 PowerShell로 요청을 쏘는 것**이었습니다. 매번 수동이고, DB 상태가 이전 테스트에 오염되고, 무엇이 깨졌는지 자동으로 알 수 없습니다.
+> 🎯 **목표**: 단위 테스트와 **서버를 띄우지 않는** 요청 테스트(`oneshot`)를 작성하고, 로그·디버거로 문제를 추적하며, 지금까지 겪은 **자주 나는 오류 TOP 10**을 정리한다. 테스트에서 DB·외부 API를 **가짜(mock)** 로 바꾸는 방법을 익힌다.
 
-이 문서에서 그걸 자동화하고, 흩어져 있던 설정을 한곳으로 모읍니다.
-
-**이 문서에서 하는 것**: 프로젝트를 lib + bin으로 재구성 → `Config` 도입 → 유닛 테스트 → `oneshot` 통합 테스트 → graceful shutdown
-
-```powershell
-cargo add dotenvy
-cargo add tokio --features signal
-cargo add --dev tower --features util
-cargo add --dev http-body-util
-cargo add --dev serde_json
-```
+| 항목 | 내용 |
+|---|---|
+| 관련 코드 | 단위: [demo/src/pagination.rs](demo/src/pagination.rs) 하단, 요청 테스트: [demo/tests/api.rs](demo/tests/api.rs), mock: [lab/src/mock_demo.rs](lab/src/mock_demo.rs) |
+| 실행 결과 | `demo`: 단위 7 + 통합 15 통과(약 1.2초). `lab`: mock 테스트 3 + 서명 검증 3 + 프롬프트/스트림 3 통과 |
 
 ---
 
-## 1. ⭐ 먼저 구조를 바꾼다 — lib + bin
+## ① 목표
 
-Rust에서 **통합 테스트는 `tests/` 폴더의 별도 크레이트**로 컴파일되고, 대상 크레이트를 **외부 사용자처럼** 가져다 씁니다. 그런데 지금 우리 코드는 전부 `main.rs`(바이너리 크레이트) 안에 있어서 **밖에서 `import`할 수가 없습니다.**
-
-해결책은 표준적입니다. **앱 로직을 라이브러리 크레이트로 옮기고, 바이너리는 얇게 만듭니다.**
-
-```
-src/
-├─ lib.rs      ← 라이브러리 크레이트 루트. 모듈 선언 + app() 조립
-├─ main.rs     ← 바이너리 크레이트 루트. 설정 로딩 + 서버 실행만
-├─ config.rs   ← 새로 추가
-├─ routes.rs   ← main.rs에 있던 데모 핸들러들을 분리
-└─ ... (나머지는 그대로)
-
-tests/
-└─ api.rs      ← 통합 테스트 (별도 크레이트)
-```
-
-`Cargo.toml`을 고칠 필요는 없습니다. **Cargo가 `src/lib.rs`와 `src/main.rs`를 자동으로 인식**합니다. 이름이 같아도(`demo`) 타깃 종류가 달라서 충돌하지 않습니다.
-
-### `src/lib.rs`
-
-```rust
-pub mod auth;
-pub mod config;
-pub mod db;
-pub mod error;
-// ... 전부 pub
-
-/// 라우터 조립. `main`에서도, 통합 테스트에서도 **이 함수 하나**를 쓴다.
-pub fn app(state: AppState) -> Router { /* study7에서 만든 그대로 */ }
-
-pub fn init_tracing() { /* ... */ }
-```
-
-- `mod` → **`pub mod`** 로 바꿔야 테스트에서 보입니다.
-- **study1부터 `fn app()`을 따로 빼둔 것이 여기서 값을 합니다.** 미리 그렇게 안 했다면 지금 라우터 조립 코드를 통째로 옮겨야 했을 겁니다.
-
-### `src/main.rs` — 얇아졌다
-
-```rust
-use demo::{app, config, config::Config, db, init_tracing, state::AppState, upload};
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    config::load_dotenv()?;
-    init_tracing();
-
-    let config = Config::from_env()?;
-    let pool = db::init(&config.database_url).await?;
-    upload::ensure_dir(&config.upload_dir).await?;
-
-    let state = AppState::new(pool, config.jwt_secret.clone(), config.upload_dir.clone());
-    let app = app(state);
-
-    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
-    tracing::info!(addr = %listener.local_addr()?, "listening");
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-
-    Ok(())
-}
-```
-
-> 자기 크레이트를 `use demo::...`로 참조하는 게 어색한데, **바이너리 입장에서 라이브러리는 외부 의존성**이기 때문입니다. (라이브러리 안에서는 `crate::`를 씁니다)
-
-### Graceful shutdown
-
-```rust
-axum::serve(listener, app)
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
-
-async fn shutdown_signal() {
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => tracing::info!("종료 신호를 받았습니다"),
-        Err(e) => tracing::error!(%e, "종료 신호를 기다리지 못했습니다"),
-    }
-}
-```
-
-Ctrl+C를 받으면 **새 연결은 거부하되 처리 중인 요청은 끝까지 마치고** 종료합니다. 배포 중 요청이 중간에 끊기는 걸 막습니다. (`tokio` `signal` feature 필요)
+1. 같은 파일 안의 **단위 테스트**와 `tests/` 폴더의 **통합(요청) 테스트**를 구분해 쓴다.
+2. `tower::ServiceExt::oneshot`으로 라우터에 요청을 **직접** 넣는다.
+3. `RUST_LOG`, `--nocapture`, `RUST_BACKTRACE`, 디버거로 원인을 좁힌다.
+4. 오류 TOP 10을 증상만 보고 원인까지 짚을 수 있다.
+5. trait로 경계를 만들고 테스트에서 가짜 구현을 끼운다.
 
 ---
 
-## 2. 설정을 한곳으로 — `Config`
+## ② 📖 이론
 
-지금까지는 이랬습니다.
+### 테스트의 층
 
-```rust
-let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data.db?mode=rwc".into());
-// ... 30줄 뒤 ...
-let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "dev-only-...".into());
-```
-
-**"이 앱이 어떤 환경변수를 쓰는가"를 알려면 코드 전체를 뒤져야 합니다.** 한곳으로 모읍니다.
-
-```rust
-#[derive(Debug, Clone)]
-pub struct Config {
-    pub database_url: String,
-    pub jwt_secret: String,
-    pub bind_addr: String,
-    pub upload_dir: String,
-}
-
-impl Config {
-    pub fn from_env() -> anyhow::Result<Self> {
-        let config = Self {
-            database_url: env_or("DATABASE_URL", "sqlite://data.db?mode=rwc"),
-            jwt_secret: env_or("JWT_SECRET", DEV_JWT_SECRET),
-            bind_addr: env_or("BIND_ADDR", "127.0.0.1:3000"),
-            upload_dir: env_or("UPLOAD_DIR", "uploads"),
-        };
-        config.validate()?;
-        Ok(config)
-    }
-
-    /// 테스트용 — in-memory DB
-    pub fn for_test() -> Self { /* ... */ }
-
-    fn validate(&self) -> anyhow::Result<()> {
-        if self.jwt_secret.len() < 16 {
-            anyhow::bail!("JWT_SECRET이 너무 짧습니다 (최소 16자)");
-        }
-        if self.jwt_secret == DEV_JWT_SECRET {
-            tracing::warn!("기본 JWT_SECRET을 쓰고 있습니다. 운영 환경에서는 반드시 설정하세요.");
-        }
-        Ok(())
-    }
-}
-```
-
-### 시작할 때 검증한다
-
-**잘못된 설정은 서버가 뜨기 전에 죽는 게 낫습니다.** "3시간 뒤 첫 로그인 요청에서 발견"보다 훨씬 좋습니다. `anyhow::bail!`은 "에러를 만들어 즉시 반환"하는 매크로입니다.
-
-실행 로그에서 경고가 실제로 보입니다.
-
-```
-WARN demo::config: 기본 JWT_SECRET을 쓰고 있습니다. 운영 환경에서는 반드시 JWT_SECRET을 설정하세요.
-```
-
-### `.env`와 `.env.example`
-
-```ini
-# .env.example  (이건 커밋한다)
-DATABASE_URL=sqlite://data.db?mode=rwc
-JWT_SECRET=dev-only-insecure-secret-change-me
-BIND_ADDR=127.0.0.1:3000
-UPLOAD_DIR=uploads
-RUST_LOG=demo=debug,tower_http=debug
-```
-
-- **`.env`는 `.gitignore`에, `.env.example`은 커밋**합니다. 새로 합류한 사람이 "무슨 변수가 필요한지" 알 수 있어야 합니다.
-- `dotenvy::dotenv()`는 **이미 설정된 환경변수를 덮어쓰지 않습니다.** 우선순위는 **실제 환경변수 > `.env` > 코드 기본값**. 컨테이너 배포에서 `.env` 없이 환경변수만 줘도 그대로 동작합니다.
-
-| | Spring Boot | NestJS | Axum |
+| 층 | 무엇을 | 속도 | 이 저장소 |
 |---|---|---|---|
-| 도구 | `application.yml` + `@Value` | `@nestjs/config` + `ConfigService` | `dotenvy` + 직접 만든 구조체 |
-| 프로파일 | `application-prod.yml` | `NODE_ENV` | 직접 (`APP_ENV` 등) |
-| 검증 | `@ConfigurationProperties` + `@Validated` | Joi 스키마 | **직접 `validate()`** |
+| **단위** | 함수 하나 (offset 계산, 서명 검증) | 즉시 | `#[cfg(test)] mod tests` — **같은 파일 안** |
+| **요청(통합)** | 라우터 + 미들웨어 + 핸들러 + DB를 요청 하나로 | 수 ms | `tests/api.rs` |
+| **E2E** | 실제 서버 + 브라우저 | 느림 | `curl` 스모크, 브라우저 수동 확인 |
 
-Axum은 여기서도 프레임워크가 해주는 게 없습니다. 대신 **구조체 하나라서 어디서 뭐가 읽히는지 100% 명확**합니다.
+Rust는 단위 테스트를 **테스트 대상과 같은 파일**에 둔다. `#[cfg(test)]`라서 일반 빌드에는 포함되지 않고, 같은 모듈이라 비공개 함수도 시험할 수 있다. `tests/`의 각 파일은 **별도 크레이트**라서 `pub`인 것만 보인다 — 외부 사용자가 되어 쓰는 시험이다.
+
+### `oneshot` — 서버 없이 요청 보내기
+
+`Router`는 tower의 `Service`다. 소켓을 열지 않고 `router.oneshot(request)`로 요청을 **함수 호출처럼** 넣고 응답을 받는다.
+
+- 포트 충돌이 없어 **병렬 실행**이 된다.
+- 네트워크 왕복이 없어 빠르다 (통합 15개 + 단위 7개가 1.2초).
+- 미들웨어 계층(요청 ID, 오류 재작성, 압축)까지 **전부 탄다.**
+- 매 테스트가 **새 in-memory DB**를 만들어 서로 격리된다.
+
+### Mock / Fake — 무엇을 가짜로 바꾸나
+
+| 용어 | 뜻 | 예 |
+|---|---|---|
+| **Fake** | 실제로 동작하는 가벼운 대체물 | in-memory SQLite, `Vec`로 만든 저장소 |
+| **Stub** | 정해진 답만 돌려주는 대체물 | 항상 `Ok(())`를 주는 알림기 |
+| **Mock/Spy** | 호출 기록을 남겨 "불렸는가"를 검사 | `FakeNotifier.sent` |
+
+**원칙**: 테스트가 의존하는 바깥세상(DB, 외부 HTTP)을 **trait 뒤로 숨기고**, 테스트에서는 그 trait의 가짜 구현을 넣는다. DI 컨테이너가 없으므로 "무엇을 넣을지"는 `router::<R, N>(state)`를 부르는 쪽이 **타입 파라미터로** 정한다.
 
 ---
 
-## 3. 유닛 테스트 — 같은 파일 안에
+## ③ 🛠️ 실기
 
-Rust는 테스트를 **테스트 대상과 같은 파일**에 둡니다. 처음엔 이상하지만 곧 편해집니다.
+### 3-1. 단위 테스트 — [demo/src/pagination.rs](demo/src/pagination.rs)
 
 ```rust
-// src/pagination.rs 맨 아래
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn query(page: u32, per_page: u32) -> PageQuery { PageQuery { page, per_page, q: None, tag: None } }
+
+    #[test]
+    fn offset은_페이지와_크기로_계산된다() {
+        assert_eq!(query(1, 10).offset(), 0);
+        assert_eq!(query(2, 10).offset(), 10);
+        assert_eq!(query(3, 25).offset(), 50);
+    }
+
     #[test]
     fn total_pages는_올림_계산이다() {
-        // 25건을 10개씩 → 3페이지 (2.5가 아니라)
-        let page = Page::new(Vec::<i32>::new(), &query(1, 10), 25);
+        let page = Page::new(Vec::<i32>::new(), &query(1, 10), 25);   // 25건 / 10 → 3페이지
         assert_eq!(page.total_pages, 3);
         assert!(page.has_next);
     }
 
     #[test]
-    fn 결과가_없으면_total_pages는_0이다() {
-        let page = Page::new(Vec::<i32>::new(), &query(1, 10), 0);
-        assert_eq!(page.total_pages, 0);
-        assert!(!page.has_next);
+    fn 검증_규칙이_범위를_막는다() {
+        use validator::Validate;
+        assert!(query(1, 10).validate().is_ok());
+        assert!(query(0, 10).validate().is_err());     // page >= 1
+        assert!(query(1, 101).validate().is_err());    // per_page <= 100
     }
 }
 ```
 
-| 요소 | 의미 |
-|---|---|
-| `#[cfg(test)]` | **`cargo test`일 때만 컴파일**된다. 릴리스 바이너리에 안 들어감 |
-| `mod tests` | 관례적인 이름. 같은 파일 안의 **비공개 항목에도 접근 가능** |
-| `use super::*;` | 부모 모듈(= 테스트 대상)의 항목을 전부 가져옴 |
-| `#[test]` | 테스트 함수 표시 |
+- 함수 이름을 **한글 문장**으로 쓰면 실패 로그가 곧 명세서가 된다 (`test pagination::tests::offset은_페이지와_크기로_계산된다 ... ok`).
+- 경계값(0, 1, 100, 101, 결과 0건)을 꼭 넣는다. 버그는 경계에서 난다.
 
-> 💡 **함수 이름을 한글로 쓸 수 있습니다.** Rust 식별자는 유니코드를 허용합니다. 테스트 이름은 실행 결과에 그대로 출력되므로 **"무엇을 검증하는지" 문장으로 쓰면 리포트가 곧 명세서**가 됩니다. (일반 코드에서는 영어를 쓰는 게 관례입니다)
-
----
-
-## 4. ⭐ 통합 테스트 — `oneshot`으로 서버 없이
-
-`tests/api.rs`:
+### 3-2. 요청 테스트 — [demo/tests/api.rs](demo/tests/api.rs)
 
 ```rust
-use axum::{Router, body::Body, http::{Request, StatusCode, header}};
-use demo::{app, config::Config, db, state::AppState};
-use http_body_util::BodyExt;
-use tower::ServiceExt;   // oneshot
-
 async fn test_app() -> Router {
-    let config = Config::for_test();          // sqlite::memory:
+    let config = Config::for_test();                      // sqlite::memory:, 고정 비밀키
     let pool = db::init(&config.database_url).await.expect("테스트 DB 초기화 실패");
-    app(AppState::new(pool, config.jwt_secret, config.upload_dir))
+    app(AppState::new(pool, config.jwt_secret, config.upload_dir))     // 운영과 같은 app()
 }
-```
 
-### 서버를 띄우지 않는다
-
-```rust
-let response = app.clone().oneshot(request).await.unwrap();
-```
-
-`Router`는 tower `Service`입니다. **`oneshot`은 요청 하나를 그 `Service`에 직접 밀어 넣고 응답을 받습니다.** TCP도, 포트도, 네트워크도 없습니다.
-
-| | 실제 서버를 띄우는 테스트 | `oneshot` |
-|---|---|---|
-| 포트 충돌 | 있음 (병렬 실행 어려움) | **없음** |
-| 속도 | 네트워크 왕복 | **함수 호출** |
-| 정리 | 프로세스 종료 관리 필요 | 자동 |
-| 커버리지 | 미들웨어 포함 전 구간 | **미들웨어 포함 전 구간** (동일) |
-
-Spring의 MockMvc, Nest의 Supertest와 같은 자리입니다. **`app()` 함수를 그대로 쓰므로 미들웨어 계층까지 전부 테스트됩니다.**
-
-- `app.clone()`이 필요한 이유: `oneshot`은 `self`를 소비합니다. `Router`의 `Clone`은 저렴하므로 문제없습니다.
-
-### 테스트마다 새 DB
-
-```rust
-let config = Config::for_test();   // database_url = "sqlite::memory:"
-```
-
-**in-memory SQLite는 테스트 격리에 완벽합니다.** 파일도 안 남고, 마이그레이션부터 새로 돌고, 테스트 간 순서 의존이 없습니다.
-
-단, `db::init`에 처리가 필요합니다.
-
-```rust
-// in-memory DB는 **연결마다 별개의 DB**가 만들어진다.
-// 풀에 연결이 2개 이상이면 "어떤 연결을 받았느냐"에 따라 테이블이 있기도 없기도 하다.
-let in_memory = database_url.contains(":memory:") || database_url.contains("mode=memory");
-
-let pool = SqlitePoolOptions::new()
-    .max_connections(if in_memory { 1 } else { 5 })
-    // ...
-```
-
-**이걸 모르면 "테스트가 가끔 `no such table: posts`로 실패하는" 지옥을 겪습니다.** 마이그레이션은 연결 A에서 돌았는데 쿼리는 연결 B로 나가기 때문입니다.
-
-### 헬퍼로 반복을 줄인다
-
-```rust
 async fn request(app: &Router, method: &str, uri: &str, body: Option<Value>, token: Option<&str>)
     -> (StatusCode, Value)
 {
     let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(t) = token {
-        builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
-    }
+    if let Some(t) = token { builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}")); }
+
     let request = match body {
-        Some(json) => builder
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(json.to_string())).unwrap(),
+        Some(json) => builder.header(header::CONTENT_TYPE, "application/json")
+                             .body(Body::from(json.to_string())).unwrap(),
         None => builder.body(Body::empty()).unwrap(),
     };
 
-    let response = app.clone().oneshot(request).await.unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();      // ← 서버 없이 호출
     let status = response.status();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let json = if bytes.is_empty() { Value::Null }
-               else { serde_json::from_slice(&bytes).unwrap_or(Value::Null) };
+    let json = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap_or(Value::Null) };
     (status, json)
 }
 ```
 
-`response.into_body().collect().await.unwrap().to_bytes()` — axum 0.7+의 본문은 **스트림**이라 한 번에 못 읽습니다. `http_body_util::BodyExt::collect()`로 모읍니다.
+| 코드 | 설명 |
+|---|---|
+| `Config::for_test()` | in-memory DB. 파일을 만들지 않고, 테스트가 끝나면 사라진다 |
+| `app(AppState::new(...))` | **`main`과 같은 `app()`을 호출**한다. lib+bin 구조의 이유 |
+| `app.clone().oneshot(request)` | `oneshot`은 서비스를 **소비**한다. `Router`의 `Clone`은 싸서 복제해 넘긴다. `use tower::ServiceExt;` 필요 |
+| `.collect().await.to_bytes()` | 응답 본문은 스트림이다. `http_body_util::BodyExt`로 끝까지 모은다 |
+| `(StatusCode, Value)` 반환 | 대부분의 시험이 "상태 코드 + JSON 필드 몇 개"만 보면 되므로 헬퍼로 줄인다 |
 
-### 실제 테스트들
+시험 목록 (한 줄이 한 가지 약속이다):
+
+```
+health_체크는_200을_돌려준다                          없는_경로는_통일된_404_json을_돌려준다
+메서드가_다르면_405다                                 패닉해도_500_json이_나간다
+토큰_없이는_글을_쓸_수_없다                           게시글_crud_전체_흐름
+남의_글은_수정할_수_없다                              검증_실패는_400과_필드별_fields를_준다
+중복_가입은_409다                                    로그인_실패_메시지는_아이디_존재_여부를_알려주지_않는다
+페이지네이션이_동작한다                               sql_인젝션_시도는_그냥_검색어로_취급된다
+페이지_파라미터_범위를_벗어나면_400이다               응답_json은_camel_case다
+오류_본문의_request_id는_응답_헤더와_같다
+```
+
+시험 하나의 모양:
 
 ```rust
-#[tokio::test]                              // ← #[test]가 아니라 #[tokio::test]
-async fn 게시글_crud_전체_흐름() {
-    let app = test_app().await;
-    let token = signup_and_login(&app, "alice").await;
-
-    let (status, created) = request(&app, "POST", "/posts",
-        Some(json!({ "title": "첫 글", "content": "본문입니다", "tags": ["rust"] })),
-        Some(&token)).await;
-
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(created["author"], "alice");   // 작성자는 토큰에서 나온다
-
-    let id = created["id"].as_i64().unwrap();
-    // ... 조회 → 수정 → 삭제 → 404 확인
-}
-
 #[tokio::test]
 async fn 남의_글은_수정할_수_없다() {
     let app = test_app().await;
     let alice = signup_and_login(&app, "alice").await;
     let bob = signup_and_login(&app, "bob").await;
-    // alice가 쓴 글을 bob이 수정 시도 → 403
-}
 
-#[tokio::test]
-async fn 로그인_실패_메시지는_아이디_존재_여부를_알려주지_않는다() {
-    // ...
-    assert_eq!(s1, StatusCode::UNAUTHORIZED);
-    assert_eq!(s2, StatusCode::UNAUTHORIZED);
-    assert_eq!(b1, b2);   // 두 응답이 완전히 같아야 한다
-}
-```
+    let (_, created) = request(&app, "POST", "/posts",
+        Some(json!({ "title": "앨리스의 글", "content": "본문" })), Some(&alice)).await;
+    let id = created["id"].as_i64().unwrap();
 
-**마지막 테스트가 특히 좋습니다.** study6에서 "메시지를 구분하면 안 된다"고 정한 보안 규칙을 **자동으로 지켜지게 만들었습니다.** 누군가 나중에 "디버깅하기 불편하네" 하며 메시지를 바꾸면 테스트가 깨집니다. — **테스트는 문서이자 가드레일입니다.**
+    let (status, body) = request(&app, "PATCH", &format!("/posts/{id}"),
+        Some(json!({ "title": "탈취 시도" })), Some(&bob)).await;
 
----
-
-## 5. 실행 결과
-
-```powershell
-cargo test
-```
-
-```
-running 5 tests
-test pagination::tests::offset은_페이지와_크기로_계산된다 ... ok
-test pagination::tests::total_pages는_올림_계산이다 ... ok
-test pagination::tests::결과가_없으면_total_pages는_0이다 ... ok
-test pagination::tests::마지막_페이지에서는_has_next가_false다 ... ok
-test pagination::tests::검증_규칙이_범위를_막는다 ... ok
-
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-
-     Running tests\api.rs
-
-running 13 tests
-test health_체크는_200을_돌려준다 ... ok
-test 메서드가_다르면_405다 ... ok
-test 페이지_파라미터_범위를_벗어나면_422다 ... ok
-test 토큰_없이는_글을_쓸_수_없다 ... ok
-test 패닉해도_500_json이_나간다 ... ok
-test 없는_경로는_통일된_404_json을_돌려준다 ... ok
-test 게시글_crud_전체_흐름 ... ok
-test sql_인젝션_시도는_그냥_검색어로_취급된다 ... ok
-test 검증_실패는_422와_필드별_상세를_준다 ... ok
-test 페이지네이션이_동작한다 ... ok
-test 로그인_실패_메시지는_아이디_존재_여부를_알려주지_않는다 ... ok
-test 중복_가입은_409다 ... ok
-test 남의_글은_수정할_수_없다 ... ok
-
-test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.71s
-```
-
-**18개 테스트가 1.7초 만에 끝납니다.** 각각 독립된 in-memory DB를 쓰면서도요. study1~8에서 손으로 확인했던 것들이 이제 전부 자동입니다.
-
-### 자주 쓰는 테스트 명령
-
-```powershell
-cargo test                      # 전부
-cargo test 페이지네이션            # 이름에 그 문자열이 들어간 것만
-cargo test --lib                # 유닛 테스트만
-cargo test --test api           # tests/api.rs만
-cargo test -- --nocapture       # println!/로그 출력 보기 (기본은 감춤)
-cargo test -- --test-threads=1  # 순차 실행 (병렬이 기본)
-```
-
-> `cargo test`는 **기본적으로 테스트를 병렬 실행**합니다. 그래서 공유 자원(같은 DB 파일, 같은 포트)을 쓰면 깨집니다. in-memory DB + `oneshot` 조합이 이 문제를 애초에 없앱니다.
-
----
-
-## 6. 처음 만난 오류
-
-### 6-1. ⭐ `.env`의 `RUST_LOG`가 적용되지 않았다
-
-`.env`에 `RUST_LOG=demo=info`를 넣고 실행했는데 DEBUG 로그가 그대로 나왔습니다.
-
-```
-DEBUG demo::config: .env 파일을 읽었습니다 ...
-DEBUG request: tower_http::trace::on_request: started processing request ...
-```
-
-**원인은 순서였습니다.**
-
-```rust
-init_tracing();               // ① EnvFilter가 여기서 RUST_LOG를 읽는다 (아직 .env 미적용)
-let config = Config::from_env()?;   // ② 이 안에서 dotenv()를 호출했다 — 너무 늦었다
-```
-
-`EnvFilter`는 **초기화 시점의 환경변수를 한 번만** 읽고 고정됩니다. `.env`를 그 뒤에 읽어봐야 소용이 없습니다.
-
-**해결**: `.env` 로딩을 별도 함수로 빼서 가장 먼저 부릅니다.
-
-```rust
-config::load_dotenv()?;   // ← 가장 먼저
-init_tracing();
-let config = Config::from_env()?;
-```
-
-수정 후 로그 (DEBUG 줄이 사라졌습니다):
-
-```
-WARN demo::config: 기본 JWT_SECRET을 쓰고 있습니다. ...
-INFO demo: 설정을 불러왔습니다 config.bind_addr="127.0.0.1:3001"
-INFO demo: database ready database_url=sqlite://data.db?mode=rwc
-INFO demo: listening addr=127.0.0.1:3001
-```
-
-> 이런 버그는 **에러가 안 나고 조용히 동작이 달라져서** 발견이 늦습니다. "왜 로그 레벨이 안 먹지?" 하고 한참 헤맬 수 있습니다.
-
-### 6-2. `Arc<String>: AsRef<Path> is not satisfied`
-
-```rust
-.nest_service("/uploads", ServeDir::new(state.upload_dir.clone()))
-```
-
-```
-error[E0277]: the trait bound `Arc<String>: AsRef<Path>` is not satisfied
-```
-
-`ServeDir::new`는 `AsRef<Path>`를 요구하는데 `Arc<String>`은 그걸 구현하지 않습니다. `&str`을 거쳐 `String`으로 풀어주면 됩니다.
-
-```rust
-let upload_dir = state.upload_dir.as_str().to_string();
-```
-
-> `Arc<T>`는 `Deref<Target = T>`라서 **메서드 호출은 자동으로 통과**하지만, **trait 제약은 자동으로 만족되지 않습니다.** 이 둘의 차이가 Rust 초심자에게 가장 헷갈리는 지점 중 하나입니다.
-
-### 6-3. `cannot find 'signal' in 'tokio'`
-
-```
-error[E0433]: cannot find `signal` in `tokio`
-note: found an item that was configured out
-  --> tokio-1.53.1\src\lib.rs:553:13
-```
-
-**"found an item that was configured out"** — 존재하는데 **feature가 꺼져 있다**는 뜻입니다. 컴파일러가 아주 친절하게 알려줍니다.
-
-```powershell
-cargo add tokio --features signal
-```
-
-tokio는 기능이 feature로 잘게 쪼개져 있어서 이 에러를 자주 만납니다. 메시지의 이 문구를 보면 바로 feature 문제임을 알 수 있습니다.
-
-### 6-4. `tracing_subscriber ... init()`을 테스트에서 두 번 부르면 패닉
-
-```rust
-pub fn init_tracing() {
-    let _ = tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer().compact())
-        .try_init();       // ← init()이 아니라 try_init()
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "FORBIDDEN");
 }
 ```
 
-전역 subscriber는 **한 번만** 설정할 수 있습니다. `init()`은 두 번째 호출에서 패닉하므로, 테스트에서 여러 번 불릴 수 있는 함수는 `try_init()`을 쓰고 결과를 무시합니다.
+실행:
+
+```
+$ cargo test
+running 7 tests ... test result: ok. 7 passed
+running 15 tests ... test result: ok. 15 passed; 0 failed; finished in 1.23s
+```
+
+### 3-3. DB·외부 API를 가짜로 — [lab/src/mock_demo.rs](lab/src/mock_demo.rs)
+
+```rust
+/// DB 접근 경계. 운영 구현은 sqlx 풀, 테스트 구현은 Vec.
+pub trait OrderRepo: Clone + Send + Sync + 'static {
+    fn insert(&self, item: String, qty: u32) -> impl Future<Output = Result<u32, String>> + Send;
+}
+/// 외부 API 경계 (메일·슬랙·결제 알림 …)
+pub trait Notifier: Clone + Send + Sync + 'static {
+    fn notify(&self, message: String) -> impl Future<Output = Result<(), String>> + Send;
+}
+
+#[derive(Clone)]
+pub struct AppState<R, N> { pub repo: R, pub notifier: N }
+
+pub fn router<R: OrderRepo, N: Notifier>(state: AppState<R, N>) -> Router {
+    Router::new().route("/orders", post(create_order::<R, N>)).with_state(state)
+}
+
+async fn create_order<R: OrderRepo, N: Notifier>(State(state): State<AppState<R, N>>, Json(body): Json<NewOrder>) -> Response {
+    if body.item.trim().is_empty() || body.qty == 0 { return StatusCode::BAD_REQUEST.into_response(); }
+
+    let id = match state.repo.insert(body.item.clone(), body.qty).await {
+        Ok(id) => id,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    // 외부 서비스 장애가 핵심 기능(주문 저장)을 막으면 안 된다.
+    let notified = state.notifier.notify(format!("새 주문 #{id}: {} x {}", body.item, body.qty)).await.is_ok();
+    (StatusCode::CREATED, Json(OrderCreated { id, notified })).into_response()
+}
+
+// ── 테스트용 가짜 ──
+#[derive(Clone, Default)]
+pub struct MemRepo { pub rows: Arc<Mutex<Vec<(u32, String, u32)>>> }
+
+#[derive(Clone, Default)]
+pub struct FakeNotifier { pub sent: Arc<Mutex<Vec<String>>>, pub fail: bool }
+```
+
+| 코드 | 설명 |
+|---|---|
+| `trait OrderRepo` / `Notifier` | **경계.** 핸들러는 sqlx도 reqwest도 모른다. trait만 안다 |
+| `impl Future<…> + Send` | trait 안의 `async` 메서드(RPITIT). `Send`를 요구해야 tokio가 다른 스레드로 옮길 수 있다 |
+| `router::<R, N>(state)` | **무엇을 주입할지를 타입으로 정한다.** 운영은 `router(AppState { repo: SqlRepo(..), notifier: HttpNotifier(..) })`, 테스트는 `MemRepo`/`FakeNotifier` |
+| `create_order::<R, N>` | 제네릭 핸들러는 등록할 때 타입을 명시한다 |
+| `Arc<Mutex<Vec<…>>>` | 가짜가 **내부 상태를 공유**하므로 테스트가 `repo.clone()`을 들고 있다가 나중에 `rows`를 검사할 수 있다 |
+| `FakeNotifier { fail: true }` | **외부 서비스 장애를 연출**한다. 실제 서비스를 끊을 필요가 없다 |
+
+세 가지 시험이 약속을 고정한다:
+
+```
+test mock_demo::tests::주문하면_저장되고_알림이_간다 ... ok          ← repo.rows 1건, sent[0] == "새 주문 #1: keyboard x 2"
+test mock_demo::tests::알림이_실패해도_주문은_성공한다 ... ok          ← 201 + notified:false
+test mock_demo::tests::잘못된_입력은_저장도_알림도_하지_않는다 ... ok    ← 400, rows·sent 모두 비어 있음
+```
+
+`demo/`에서의 같은 원리: **DB는 in-memory SQLite가 곧 fake**다. 그래서 별도 mock 없이도 진짜 SQL과 마이그레이션까지 시험한다. 외부 HTTP(결제·AI 서버)는 위 trait 방식으로 갈아 끼운다 (study13, study18).
+
+### 3-4. 디버깅 도구
+
+| 도구 | 쓰는 법 | 언제 |
+|---|---|---|
+| `cargo test -- --nocapture` | 테스트의 `println!`/로그를 그대로 출력 | 시험이 왜 실패하는지 볼 때 |
+| `cargo test 이름조각` | 이름에 조각이 들어간 시험만 | 한 개만 반복 실행 |
+| `RUST_BACKTRACE=1` | 패닉 시 호출 스택 출력 (`=full`은 더 자세히) | 패닉 위치를 모를 때 |
+| `RUST_LOG=demo=debug,tower_http=debug,axum::rejection=trace` | 로그 레벨 조절. `axum::rejection=trace`는 **extractor가 거절한 이유**를 보여 준다 | 400/415/422의 원인 |
+| `dbg!(&값)` | 파일·줄·값을 stderr에 | 값 하나가 궁금할 때 |
+| `#[axum::debug_handler]` | `Handler is not satisfied`의 **정확한 원인**을 컴파일러가 짚게 한다 | 핸들러 시그니처 에러 |
+| `curl -v` / `-i` | 요청·응답 헤더까지 | 상태 코드·헤더·쿠키 |
+| `x-request-id` | 응답 헤더 = 오류 본문 `requestId` = 서버 로그의 같은 ID | 한 요청을 추적 |
+| **CodeLLDB** (VS Code) | 줄 왼쪽 클릭으로 중단점 → "Debug" | 변수 값을 단계별로 |
+
+CodeLLDB 시작 설정(`.vscode/launch.json`, 저장소에는 커밋하지 않음):
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "demo 디버그",
+      "cargo": { "args": ["build", "--manifest-path", "demo/Cargo.toml"] },
+      "cwd": "${workspaceFolder}/demo",
+      "env": { "RUST_LOG": "demo=debug" }
+    }
+  ]
+}
+```
+
+### 3-5. 로그 읽는 법
+
+```
+2026-11-22T15:09:36Z  WARN demo::config: 기본 JWT_SECRET을 쓰고 있습니다. 운영 환경에서는 반드시 JWT_SECRET을 설정하세요.
+2026-11-22T15:09:36Z  INFO demo: 설정을 불러왔습니다 config.bind_addr="127.0.0.1:3100"
+```
+
+`시각  레벨  모듈경로: 메시지 key=value …` — **모듈 경로**로 어느 계층의 로그인지, **레벨**로 심각도(ERROR > WARN > INFO > DEBUG > TRACE)를 본다. 구조적 필드(`key=value`)는 `tracing::info!(addr = %listener.local_addr()?, "listening")`처럼 남긴다. **500의 원인은 응답이 아니라 서버 로그에 있다** (응답은 일부러 고정 문구).
+
+### 3-6. ⭐ 자주 나는 오류 TOP 10 (이 저장소에서 실제로 겪은 것)
+
+| # | 증상 | 원인 | 해결 | 단계 |
+|---|---|---|---|---|
+| 1 | 실행하자마자 패닉 `Path segments must not start with ':'` | axum 0.8: `:id` → `{id}` | 경로를 `{id}`로. 컴파일은 통과하고 **실행할 때** 알려 줌 | study1 |
+| 2 | `the trait bound ... Handler<_, _> is not satisfied` | ① 본문 extractor가 마지막이 아님 ② `AppState`에 `Clone` 없음 ③ `.with_state()` 누락 | `#[axum::debug_handler]`로 원인 확인 | study1·2·5 |
+| 3 | `target\debug\*.exe: Access is denied (os error 5)` | 서버가 실행 중인 채 재빌드 (Windows 파일 잠금) | 서버 종료 후 빌드 | study0 |
+| 4 | 로그인 요청에서 `connection closed unexpectedly` (500도 아님) | jsonwebtoken 11에 `rust_crypto` feature 없음 → 런타임 패닉 → 연결 끊김 | `cargo add jsonwebtoken --features rust_crypto`. 이 일 때문에 `CatchPanicLayer`를 붙임 | study7·8 |
+| 5 | 테스트가 랜덤하게 `no such table` | in-memory SQLite는 연결마다 별개의 DB, 풀 연결 2개 이상 | `max_connections(1)` | study6 |
+| 6 | `dynamic SQL strings should be audited for possible injections` | sqlx 0.9: `format!`로 만든 SQL 거부 | `$1` 바인딩, 동적 조건은 `QueryBuilder` | study6 |
+| 7 | `unable to open database file` / `database is locked` | `create_if_missing` 기본 false / WAL·`busy_timeout` 없음 | 연결 옵션 3종 세트 | study6 |
+| 8 | `found an item that was configured out` | tokio(등) **feature 누락** | `cargo add tokio --features signal` | study8 |
+| 9 | `.env`의 `RUST_LOG`가 조용히 무시됨 | `EnvFilter`는 초기화 시점에 한 번 읽음, `.env`를 뒤에 읽음 | `load_dotenv()` → `init_tracing()` | study0·8 |
+| 10 | SPA 딥링크가 404 (`ServeDir::not_found_service`) | `not_found_service`는 상태를 **404로 강제** | `.fallback(...)`을 쓴다 (소스를 열어 확인) | study12 |
+
+> 이 10개의 공통점: **버전 차이**가 절반이다. 블로그 예제를 붙여넣기 전에 `Cargo.toml`의 버전부터 확인하고, 의심스러우면 `cargo doc --open`으로 **내 버전의** 문서를 연다. 그리고 **컴파일러 메시지는 대부분 해결책을 말해 준다**(`note:`, `help:` 줄을 끝까지 읽는다).
 
 ---
 
-## 7. 이번 study 정리
+## ④ 🔗 연동 포인트 — 테스트에서 DB·API를 가짜로 바꾸기
 
-- 통합 테스트를 하려면 **lib + bin 구조**가 필요하다. 앱 조립은 `lib.rs`의 `pub fn app()`에, `main.rs`는 얇게.
-- **`fn app()`을 처음부터 분리해 둔 것**이 여기서 값을 한다.
-- 설정은 **`Config` 구조체 하나**로 모으고 **시작할 때 검증**한다. `.env`는 무시, `.env.example`은 커밋.
-- **`.env` 로딩은 `init_tracing()`보다 먼저.** `EnvFilter`는 초기화 시점의 환경변수만 본다.
-- 유닛 테스트는 `#[cfg(test)] mod tests`로 **같은 파일 안**에. 함수 이름을 한글 문장으로 쓰면 리포트가 명세서가 된다.
-- 통합 테스트는 **`tower::ServiceExt::oneshot`** 으로 서버 없이. 포트 충돌이 없고 빠르며 미들웨어까지 전부 탄다.
-- **in-memory SQLite는 반드시 `max_connections(1)`.** 연결마다 별개의 DB라서 안 그러면 랜덤하게 깨진다.
-- 보안 규칙(로그인 메시지 동일성 등)을 **테스트로 고정**해 두면 나중에 누가 되돌리는 걸 막을 수 있다.
-- `axum::serve(...).with_graceful_shutdown(...)`으로 배포 중 요청이 끊기지 않게 한다.
+| 바깥세상 | 운영 | 테스트 | 방법 |
+|---|---|---|---|
+| **DB (sqlx)** | 파일 SQLite / PostgreSQL | **in-memory SQLite** | `Config::for_test()` → `sqlite::memory:` (`max_connections(1)`) |
+| **DB (trait로 감싼 경우)** | `SqlRepo` | `MemRepo` (`Vec`) | `router::<MemRepo, _>` |
+| **외부 HTTP API** (결제·메일·AI) | `reqwest` 기반 구현 | `FakeNotifier`, 또는 **같은 프로세스의 가짜 HTTP 서버** | trait 경계 + 가짜 구현 (study13: 가짜 OAuth 서버, study18: 가짜 AI 서버) |
+| **시간·난수** | `Utc::now()`, `Uuid::new_v4()` | 고정값 | 값을 인자로 받거나 trait로 주입 |
+| **파일 시스템** | `uploads/` | 임시 디렉터리 | `Config.upload_dir`을 테스트에서 따로 지정 |
+| **PostgreSQL** | 실제 서버 | `TEST_DATABASE_URL` | `cargo test --no-default-features --features postgres` (study11) |
 
-다음: [study10.md](study10.md) — OpenAPI 문서화와 Docker 배포. (고급 5)
+CI(study16)에서는 `cargo test`가 **서버·네트워크 없이** 돌아야 한다. 위 가짜들이 그것을 가능하게 한다.
+
+---
+
+## ⑤ 오류 노트
+
+| 증상 | 원인 | 해결 |
+|---|---|---|
+| `tests/`에서 `use demo::...`가 안 됨 | `main.rs`만 있고 `lib.rs`가 없음 | lib+bin 구조로 (study8). `Cargo.toml`의 `[lib]` 이름 확인 |
+| `oneshot` 호출이 `no method named oneshot` | `tower::ServiceExt`를 import하지 않음 | `use tower::ServiceExt;` + dev-dependency에 `tower = { features = ["util"] }` |
+| 응답 본문을 못 읽음 | `BodyExt`가 없음 | `http-body-util`을 dev-dependency에 추가하고 `use http_body_util::BodyExt;` |
+| 테스트가 가끔만 실패 | 시험들이 **같은 파일·같은 DB·같은 포트**를 공유 | 시험마다 in-memory DB, 서버 대신 `oneshot`. 환경변수를 바꾸는 시험은 직렬로 |
+| 한 시험의 `init_tracing()`이 패닉 | `init()`은 두 번째 호출에서 패닉 | `try_init()` |
+| 한글 시험 이름이 깨짐 (PowerShell) | 터미널 인코딩 | 시험은 정상. 보기만 UTF-8로 (`chcp 65001`, `Get-Content -Encoding UTF8`) |
+| `cargo test`가 `tests/api.rs`를 건너뜀 | `--no-default-features --features postgres`로 빌드하면 `#![cfg(feature = "sqlite")]`로 제외됨 | 의도된 동작. PostgreSQL 시험은 별도 DB가 필요 |
+| mock이 항상 성공해서 **실제 장애 경로를 못 시험** | 가짜에 `fail` 스위치가 없음 | 실패·지연·잘못된 응답을 연출하는 필드를 둔다 (`FakeNotifier.fail`) |
+| 가짜와 진짜가 **다르게 동작**해서 운영에서만 버그 | 가짜가 현실을 단순화함 (예: `LIKE` 대소문자) | 가능하면 **진짜 DB**(in-memory SQLite, 컨테이너 PostgreSQL)로 핵심 경로를 시험. study11에서 SQLite/PostgreSQL 차이를 실제로 겪었다 |
+| 타임아웃 시험이 5초씩 걸림 | `/slow`가 진짜로 5초 대기 | 시험용으로 타임아웃 값을 주입 가능하게 하거나, 그 시험만 따로 둔다 |
+
+---
+
+## ⑥ 직접 해보기
+
+1. **시험 먼저 쓰기**: `GET /posts?page=0`이 400 `VALIDATION_ERROR`와 `fields.page`를 주는 시험을 **먼저** 쓰고 실패(빨강)를 확인한 뒤, 통과(초록)하는지 본다. 이미 통과한다면 왜 통과하는지 `PageQuery`의 `validate`에서 찾는다.
+2. **`FakeNotifier` 활용**: `lab/src/mock_demo.rs`에 "알림 메시지에 수량이 0이면 안 나간다" 같은 규칙을 하나 추가하고, `fail: true`와 정상 두 경로를 시험한다.
+3. **`RUST_LOG=axum::rejection=trace`**: 서버를 띄우고 잘못된 JSON을 보내 거절 이유가 로그에 찍히는 것을 확인한다. 같은 요청이 응답에서는 어떻게 보이는지 비교한다.
+
+---
+
+## ⑦ ☐ 체크리스트
+
+- ☐ 단위 테스트(같은 파일)와 통합 테스트(`tests/`)의 차이를 설명할 수 있다
+- ☐ `oneshot`이 서버 없이 라우터를 호출한다는 것과 그 장점(병렬·빠름·미들웨어 포함)을 안다
+- ☐ `cargo test`를 실행해 `demo` 22개(단위 7 + 통합 15)가 통과하는 것을 확인했다
+- ☐ 시험마다 새 in-memory DB를 쓰는 이유(격리)를 설명할 수 있다
+- ☐ `RUST_LOG`, `--nocapture`, `RUST_BACKTRACE`, `#[axum::debug_handler]`를 상황에 맞게 고를 수 있다
+- ☐ 로그 한 줄에서 시각·레벨·모듈·필드를 읽을 수 있고, 500의 원인은 서버 로그에 있다는 것을 안다
+- ☐ 오류 TOP 10 중 증상을 보고 원인을 말할 수 있는 것이 8개 이상이다
+- ☐ trait 경계 + 가짜 구현으로 DB·외부 API를 갈아 끼우는 코드를 직접 만들어 봤다
+- ☐ 가짜가 현실을 단순화해서 생기는 위험(예: `LIKE` 대소문자)을 안다
+
+---
+
+## ⑧ 다음 단계 연결
+
+시험이 통과하면 **밖으로 내보낼** 차례다. [study10](study10.md)에서는 릴리스 빌드, 멀티 스테이지 Docker 이미지, 도메인·HTTPS 개념, 배포 후 점검표를 정리하고 기초 구간(study0~10)을 마무리한다.
